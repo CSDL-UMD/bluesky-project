@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bluesky Data Visualization</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://code.jquery.com/jquery-3.6.4.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.7.0/chart.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/chartjs-plugin-zoom/1.1.1/chartjs-plugin-zoom.min.js"></script>
+    <link rel="stylesheet" href="https://code.jquery.com/ui/1.12.1/themes/base/jquery-ui.css">
+    <script src="https://code.jquery.com/ui/1.12.1/jquery-ui.js"></script>
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Open+Sans&family=Roboto+Slab:wght@500&display=swap');
+
+    body, html {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        overflow: hidden;
+        font-family: 'Open Sans', sans-serif;
+        background-color: #dadae6;
+    }
+
+    .container {
+        display: flex;
+        height: 100vh;
+        overflow-x: hidden;
+    }
+
+    .input-box{
+        margin-bottom: 5%;
+    }
+
+    #sidebar {
+        background-color: #3f4350;
+        box-shadow: 2px 0 5px rgba(0, 0, 0, 0.1);
+        padding: 2%;
+        flex-basis: 25%;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+    }
+
+    #sidebar-content {
+        width: 100%;
+        max-width: 100%;
+    }
+
+    canvas {
+        display: block;
+        width: 100%;
+        margin: auto;
+        height: auto;
+        padding: 20px;
+        max-width: 1200px;
+    }
+
+    h1 {
+        text-decoration: underline;
+        text-decoration-skip-ink: none;
+        font-size: 2em;
+        margin: 20px;
+        margin-bottom: 20%;
+        color: #333;
+        font-family: 'Roboto Slab', serif;
+        color: #fff;
+    }
+
+    label {
+        text-transform: uppercase;
+        letter-spacing: 2px;
+        font-family: 'Open Sans', sans-serif;
+        font-size: 15px;
+        font-weight: 600;
+        margin-bottom: 10%;
+        color: #fff;
+    }
+
+        button {
+            align-items: center;
+            appearance: none;
+            background-color: #FCFCFD;
+            border-radius: 4px;
+            border-width: 0;
+            box-shadow: rgba(45, 35, 66, 0.4) 0 2px 4px,rgba(45, 35, 66, 0.3) 0 7px 13px -3px,#D6D6E7 0 -3px 0 inset;
+            box-sizing: border-box;
+            color: #36395A;
+            cursor: pointer;
+            display: inline-flex;
+            font-family: "JetBrains Mono",monospace;
+            height: 48px;
+            justify-content: center;
+            line-height: 1;
+            list-style: none;
+            overflow: hidden;
+            padding-left: 16px;
+            padding-right: 16px;
+            margin-top: 20%;
+            position: relative;
+            text-align: left;
+            text-decoration: none;
+            transition: box-shadow .15s,transform .15s;
+            user-select: none;
+            -webkit-user-select: none;
+            touch-action: manipulation;
+            white-space: nowrap;
+            will-change: box-shadow,transform;
+            font-size: 18px;
+        }
+
+        button:focus {
+            box-shadow: #D6D6E7 0 0 0 1.5px inset, rgba(45, 35, 66, 0.4) 0 2px 4px, rgba(45, 35, 66, 0.3) 0 7px 13px -3px, #D6D6E7 0 -3px 0 inset;
+        }
+
+        button:hover {
+            box-shadow: rgba(45, 35, 66, 0.4) 0 4px 8px, rgba(45, 35, 66, 0.3) 0 7px 13px -3px, #D6D6E7 0 -3px 0 inset;
+            transform: translateY(-2px);
+        }
+
+        button:active {
+            box-shadow: #D6D6E7 0 3px 7px inset;
+            transform: translateY(2px);
+        }
+    </style>
+
+</head>
+
+<body>
+    <div class="container">
+        <div id="sidebar">
+            <h1>Bluesky Data Visualization</h1>
+            <label>Select Date or Month:</label>
+            <br><br>
+            <div class = "input-box">
+                <input type="radio" id="selectDate" name="displayOption" value="selectDate" checked>
+                <label for="selectDate">Select Date:</label>
+            </div>
+            <input type="text" id="datepicker" value="" readonly>
+            <br><br>
+            <div class = 'input-box'>
+                <input type="radio" id="selectMonth" name="displayOption" value="selectMonth">
+                <label for="selectMonth">Select Month:</label>
+            </div>
+            <input type="month" id="monthpicker" value="" readonly>
+            <br><br>
+            
+            <button id="updateChart">Update Chart</button>
+        </div>
+        <canvas id="myChart"></canvas>
+    </div>
+
+    <script>
+        var myChart;
+        var selectedDate;
+
+        function updateChart(data) {
+        if (selectedDate !== null) {
+            var filteredData;
+            if ($('input[name=displayOption]:checked').val() === 'selectMonth') {
+                const selectedMonth = selectedDate.slice(0, 7);
+                filteredData = data.filter(entry => entry.day.startsWith(selectedMonth));
+
+                filteredData = filteredData.reduce((accumulator, entry) => {
+                    const date = entry.day.slice(0, 10);
+                    if (!accumulator[date]) {
+                        accumulator[date] = {
+                            day: date,
+                            totallinks: 0,
+                            newslessthan60: 0,
+                            newsgreaterthan60: 0
+                        };
+                    }
+
+                    accumulator[date].totallinks += entry.totallinks;
+                    accumulator[date].newslessthan60 += entry.newslessthan60;
+                    accumulator[date].newsgreaterthan60 += entry.newsgreaterthan60;
+
+                    return accumulator;
+                }, {});
+                
+                filteredData = Object.values(filteredData);
+            } else {
+                filteredData = data.filter(entry => entry.day.startsWith(selectedDate));
+            }
+
+            const filteredLabels = filteredData.map(entry => {
+            const date = new Date(entry.day);
+            if ($('input[name=displayOption]:checked').val() === 'selectMonth') {
+                return new Date(date.getFullYear(), date.getMonth(), date.getDate()).toLocaleDateString('en-US', {
+                    month: 'long',
+                    day: 'numeric',
+                });
+            } else {
+                const roundedDate = new Date(date);
+                roundedDate.setMinutes(0); 
+                roundedDate.setSeconds(0); 
+                return roundedDate.toLocaleString('en-US', { hour: 'numeric', minute: 'numeric', second: 'numeric' });
+            }
+        });
+            const filteredTotalLinks = filteredData.map(entry => entry.totallinks);
+            const filteredNewsLessThan60 = filteredData.map(entry => entry.newslessthan60);
+            const filteredNewsGreaterThan60 = filteredData.map(entry => entry.newsgreaterthan60);
+
+            if (myChart) {
+                myChart.destroy();
+            }
+
+            var canvas = document.getElementById('myChart');
+            var ctx = canvas.getContext('2d');
+            myChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: filteredLabels,
+                    datasets: [
+                        {
+                            label: 'Total Links',
+                            data: filteredTotalLinks,
+                            borderColor: 'rgba(50, 205, 50, 1)',
+                            backgroundColor: 'rgba(50, 205, 50, 0.2)',
+                            borderWidth: 2,
+                            fill: true
+                        },
+                        {
+                            label: 'News Less Than 60',
+                            data: filteredNewsLessThan60,
+                            borderColor: 'rgba(255, 0, 0, 1)',
+                            backgroundColor: 'rgba(255, 0, 0, 0.2)', 
+                            borderWidth: 2,
+                            fill: true
+                        },
+                        {
+                            label: 'News Greater Than 60',
+                            data: filteredNewsGreaterThan60,
+                            borderColor: 'rgba(54, 162, 235, 1)',
+                            backgroundColor: 'rgba(54, 162, 235, 0.2)', 
+                            borderWidth: 2,
+                            fill: true
+                        }
+                    ]
+                },
+                options: {
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                        }
+                    },
+                    plugins: {
+                        afterDatasetsDraw: function (chart) {
+                            var ctx = chart.ctx;
+                            var xAxis = chart.scales['x'];
+                            var yAxis = chart.scales['y'];
+
+                            chart.data.datasets[0].data.forEach((value, index) => {
+                                if (index < chart.data.labels.length - 1) {
+                                    const x = xAxis.getPixelForValue(chart.data.labels[index]);
+                                    const y = yAxis.getPixelForValue(value);
+                                    ctx.fillText(value, x, y + 10);
+                                }
+                            });
+                        }
+                    }
+                }
+            });
+        } else {
+            console.error('Selected date is null.');
+        }
+    }
+
+        document.addEventListener("DOMContentLoaded", function () {
+            fetch('/get_data')
+                .then(response => response.json())
+                .then(data => {
+                    window.data = data;
+
+                    selectedDate = new Date().toISOString().split('T')[0];
+                    $('#datepicker').val(selectedDate);
+
+                    var currentMonth = new Date().toISOString().slice(0, 7);
+                    $('#monthpicker').val(currentMonth);
+
+                    $("#datepicker").datepicker({
+                        dateFormat: "yy-mm-dd",
+                        onSelect: function (dateText, inst) {
+                            selectedDate = dateText;
+                        }
+                    });
+
+                    $("#monthpicker").datepicker({
+                        dateFormat: "yy-mm",
+                        onSelect: function (dateText, inst) {
+                            selectedDate = dateText;
+                        }
+                    });
+                    updateChart(data);
+
+                    $("#updateChart").on("click", function () {
+                        updateChart(data);
+                    });
+
+                    $("input[name=displayOption]").change(function () {
+                        if ($('input[name=displayOption]:checked').val() === 'selectMonth') {
+                            selectedDate = $('#monthpicker').val();
+                        } else {
+                            selectedDate = $('#datepicker').val();
+                        }
+                    });
+                })
+                .catch(error => console.error('Error fetching data:', error));
+
+            window.addEventListener('resize', function () {
+                if (myChart) {
+                    myChart.resize();
+                }
+            });
+        });
+    </script>
+</body>
+</html>

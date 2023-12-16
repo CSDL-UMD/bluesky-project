@@ -62,6 +62,23 @@ db.connect((err) => {
    	 }
 });
 
+app.get('/', (req, res) => {
+    res.sendFile(__dirname + '/app.html');
+});
+
+app.get('/get_data', (req, res) => {
+    const query = 'SELECT day, totalmessages, totallinks, newsgreaterthan60, newslessthan60 FROM bsky_news';
+    db.query(query, (err, results) => {
+      if (err) {
+        console.error('Error executing query:', err);
+        res.status(500).json({ error: 'Internal Server Error' });
+        return;
+      }
+      res.json(results);
+    });
+});
+
+app.use(express.static('public'));
 app.listen("3000", () => {});
 
 // Define a function to promisify the database query
