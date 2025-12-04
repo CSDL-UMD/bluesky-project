@@ -131,7 +131,7 @@ async def main():
     """
     Main entry point to start the orchestrating process with an optional starting file.
     """
-    await orchestrate(starting_file="./Payload/2025-07-08/2025-07-08_18-23-16.json.gz")
+    await orchestrate(starting_file="./Payload/2025-12-04/2025-12-04_02-22-16.json.gz")
 
 if __name__ == "__main__":
     asyncio.run(main())
