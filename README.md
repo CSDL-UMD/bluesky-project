@@ -1,101 +1,174 @@
-<a name="readme-top"></a>
-<br />
 <div align="center">
-<h3 align="center">MurkySky</h3>
 
-  <p align="center">
-    <br />
-    <a href="https://csdl.umd.edu/murkysky/">View Demo</a>
-  </p>
+# MurkySky
+
+### Real-time News Credibility Monitoring on Bluesky
+
+**Computational Social Dynamics Lab • University of Maryland**
+
+[![View Demo](https://img.shields.io/badge/🔗-Live_Demo-blue?style=for-the-badge)](https://csdl.umd.edu/murkysky/)
+
+
+![Python](https://img.shields.io/badge/Python-3776AB?style=flat-square&logo=python&logoColor=white)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-316192?style=flat-square&logo=postgresql&logoColor=white)
+![Shiny](https://img.shields.io/badge/Shiny-75AADB?style=flat-square&logo=rstudio&logoColor=white)
+
 </div>
 
-## About The Project
+---
 
-Bluesky, an innovative social media hub where users share posts, including news articles, is dedicated to upholding the integrity of information. This project monitors Bluesky posts, extracts URLs, and evaluates their credibility in real-time using NewsGuard's rating system. The findings are presented via a frontend application, providing users with valuable insights into the quality of news information on Bluesky.
+## Overview
 
-### Built With
+MurkySky is a real-time monitoring system that evaluates the credibility of news content shared on Bluesky, an emerging decentralized social media platform. The system continuously ingests posts from Bluesky's firehose, extracts shared URLs, and evaluates their credibility using NewsGuard's rating system. Results are accessible through an interactive web dashboard and a public REST API, enabling researchers to study information quality dynamics on social media.
 
-* [![Javascript][Javascript]][Javascript-url]
-* [![Python][Python]][Python-url]
-* [![PostgreSQL][PostgreSQL]][PostgreSQL-url]
-* [![Shiny][Shiny]][Shiny-url]
+---
+
+## System Architecture
+
+<div align="center">
+
+```mermaid
+graph LR
+    A["Bluesky Firehose"] --> B["WebSocket Collector"]
+    B --> C["Compressed Storage"] --> D["Orchestrator"]
+    D --> E["Data Enrichment"] --> F["URL Analysis"]
+    F --> G["NewsGuard Scoring"] --> H[("PostgreSQL")]
+    H --> I["Dashboard"]
+    H --> J["REST API"]
+    
+    style A fill:#bbdefb,stroke:#1565c0,stroke-width:3px,color:#000
+    style B fill:#bbdefb,stroke:#1565c0,stroke-width:3px,color:#000
+    style C fill:#bbdefb,stroke:#1565c0,stroke-width:3px,color:#000
+    style D fill:#ffe0b2,stroke:#e65100,stroke-width:3px,color:#000
+    style E fill:#ffe0b2,stroke:#e65100,stroke-width:3px,color:#000
+    style F fill:#ffe0b2,stroke:#e65100,stroke-width:3px,color:#000
+    style G fill:#ffe0b2,stroke:#e65100,stroke-width:3px,color:#000
+    style H fill:#e1bee7,stroke:#6a1b9a,stroke-width:3px,color:#000
+    style I fill:#c8e6c9,stroke:#2e7d32,stroke-width:3px,color:#000
+    style J fill:#c8e6c9,stroke:#2e7d32,stroke-width:3px,color:#000
+```
+</div>
+
+---
+
+## Data Collection Pipeline
+
+The pipeline operates continuously through four integrated stages:
+
+### **Stage 1: Firehose Collection**
+`websocket.py` maintains a persistent connection to Bluesky's Jetstream WebSocket API, subscribing to posts, reposts, and likes. Data is organized into daily directories and compressed hourly. The collector implements automatic reconnection to ensure continuous operation.
+
+### **Stage 2: Orchestration** 
+`orchestrator.py` monitors the data directory and manages parallel processing across worker threads. When new files arrive, it sequences them through preprocessing and analysis while maintaining system health.
+
+### **Stage 3: Data Enrichment**
+`preprocess.py` enriches reposts and likes by fetching original post content via Bluesky's API. Using concurrent batch requests with rate limiting, it retrieves post text, embedded URLs, and engagement metrics, enabling analysis of content propagation.
+
+### **Stage 4: URL Analysis & Scoring**
+`data_processing.py` extracts and analyzes shared URLs, resolves shortened links, and matches them against NewsGuard's domain trust scores (0-100 scale). Links are classified as reliable (≥60) or unreliable (<60), with aggregated statistics stored in PostgreSQL.
+
+---
+
+## Interactive Dashboard
+
+The web application provides researchers with flexible data exploration capabilities through an intuitive interface.
+
+**Visualization Features:**
+- Time-series area charts with color-coded layers (reliable/unreliable/total links)
+- Toggle between hourly and daily granularity
+- Predefined windows (7 days, 30 days, all data) or custom date ranges
+- Switch between absolute counts and relative proportions
+
+**Real-time Analytics:**
+- Weather metaphor representing current information climate
+- 7-day unreliable news percentage
+- Top shared stories segmented by credibility
+
+---
+
+## REST API
+
+The FastAPI-based public API provides programmatic access to MurkySky data for researchers.
+
+### Key Endpoints
+
+**`GET /time_series`** - Retrieve time-series news statistics  
+Query by period (all/seven/thirty/custom), granularity (hour/day), and format (absolute/relative)
+
+**`GET /stats`** - Access top URLs or domains  
+Filter by score range, time window, and aggregation type
+
+**`GET /payload`** - Stream raw firehose data  
+Efficiently stream large datasets with filtering by timestamp and content type
+
+---
 
 ## Getting Started
 
-Below are the steps to set up your project locally and get it up and running smoothly.
-
 ### Prerequisites
 
-This project requires [Node.js](http://nodejs.org/) and [npm](https://npmjs.org/). To make sure you have them available on your machine, try running the following command.
-```sh
-$ npm -v && node -v
-```
-Next, install [Python3](https://www.python.org/downloads/). On a Unix-based OS, the system's default Python installation is normally Python 2. To make sure you have it downloaded on your machine, try running the following command.
-```sh
-$ python3 --version
-$ pip3 --version
+```bash
+Python 3.8+
+PostgreSQL
+Node.js
+NewsGuard Metadata CSV
 ```
 
-If pip3 is not installed after installing Python3, then run the following command, and check again if it is installed.
-```sh
-$ python -m pip3 install --upgrade pip
-$ pip3 --version
+### Environment Configuration
+
+Create `.env` with database credentials:
+
+```env
+DB_HOST=your_database_host
+DB_USER=your_database_user
+DB_PASSWORD=your_database_password
+DB_DATABASE=your_database_name
+DB_PORT=5432
 ```
 
-Finally, install Shiny for Python, and verify that it is downloaded on your machine.
-```sh
-$ pip3 install shiny
-$ pip3 show shiny
+
+### Database Schema
+
+```sql
+CREATE TABLE bsky_news (
+    day TIMESTAMP,
+    totalmessages INTEGER,
+    totallinks INTEGER,
+    newsgreaterthan60 INTEGER,
+    newslessthan60 INTEGER
+);
+
+CREATE TABLE newsguard_counts (
+    url TEXT,
+    domain TEXT,
+    score INTEGER,
+    timestamp TIMESTAMP,
+    count INTEGER,
+    PRIMARY KEY (url, timestamp)
+);
 ```
 
-### Installation
+---
 
-1. Clone the repo
-   ```sh
-   git clone https://github.com/CSDL-UMD/bluesky-project.git
-   ```
-2. Install npm packages
-   ```sh
-   npm install
-   ```
-3. Create a folder named "Messages" to store text files for posts, likes, and reposts. Additionally, create a folder named "NewsGuard" and include the following CSV files:
-    * `all-sources-metadata.csv`
-    * `metadata.csv` 
-4. Enter your Bluesky and Database credentials in `.env`
-   ```sh
-    BLUESKY_USERNAME = 'Username'
-    BLUESKY_PASSWORD = 'Password'
-    DB_HOST = 'Remote Server'
-    DB_USER = 'Database'
-    DB_PASSWORD = 'Database Password'
-   ```
+## Running the System
 
-### Deploy
+### Step 1: Start Data Collection
+```bash
+# Terminal 1: Flask backend
+python3 firehose/orchestrator.py
+```
 
-## Firehose
+### Step 2: Launch Services
+```bash
+# Terminal 2: Flask Backend
+python3 web/backend.py
 
-To start collecting data from the firehose, run the following command:
-   ```sh
-   pm2 start index.js --name "bluesky"
-   ```
-Check that it is running successfully through the following command:
-   ```sh
-   pm2 list
-   ```
-## Frontend Application
-To view the frontend application, run the following command.
-   ```sh
-   python3 -m uvicorn app:app --host 0.0.0.0 --port 3000 --reload
-   ```
-Access the application by entering http://127.0.0.1:3000/ in your web browser.
+# Terminal 3: Shiny Web Application
+uvicorn web:app --host 0.0.0.0 --port 8000
+```
 
+### Step 3: Access Applications
+- **Dashboard:** `http://localhost:8000/murkysky/`
+---
 
-<!-- MARKDOWN LINKS & IMAGES -->
-[Javascript]: https://shields.io/badge/JavaScript-F7DF1E?logo=JavaScript&logoColor=000&style=flat-square
-[Javascript-url]: https://www.javascript.com/
-[Python]: https://img.shields.io/badge/python-3670A0?style=for-the-badge&logo=python&logoColor=ffdd54
-[Python-url]: https://www.python.org/
-[PostgreSQL]: https://img.shields.io/badge/postgresql-4169e1?style=for-the-badge&logo=postgresql&logoColor=white
-[PostgreSQL-url]: https://www.postgresql.org/
-[Shiny]: https://img.shields.io/badge/Shiny-shinyapps.io-blue?style=flat&labelColor=white&&logoColor=blue
-[Shiny-url]: https://shiny.posit.co/
+</div>
