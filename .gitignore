@@ -1,4 +1,21 @@
-node_modules
+Payload
 NewsGuard
 Messages
+
+# Preprint Results
+Gephi_Like
+Gephi_Repost
+Hashtag_Like
+Hashtag_Repost
+Network
+Orientation
+
+# Package files
+node_modules
+unshorten-fast
+api_errors.log
+shorturl-services-list.csv
+
+#Env
+env
 .env
