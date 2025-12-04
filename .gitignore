@@ -12,6 +12,7 @@ Orientation
 
 # Package files
 node_modules
+__pycache__
 unshorten-fast
 api_errors.log
 shorturl-services-list.csv
