@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MurkySky</title>
+    <style>
+         @import url('https://fonts.googleapis.com/css2?family=Jost:wght@500&display=swap');
+        body {
+            font-family: Jost;
+            margin-left: 15px;
+        }
+
+        h1 {
+            font-size: 2.32rem;
+            margin: 0px;
+        }
+
+        h2 {
+            font-size: 1.57rem;
+            margin-top: 10px;
+            margin-bottom: 10px;
+        }
+
+        p {
+            font-size: 1.12rem;
+            margin-bottom: 35px;
+            margin-top: 0px;
+        }
+    </style>
+</head>
+<body>
+    <h1>MurkySky</h1>
+    <section>
+        <h2>What do the emojis mean?</h2>
+        <p>The emoji represents the “weather condition” on Bluesky when it comes to news sharing, and it is based on the fraction of unreliable news links over the last 7 days. The possible weather conditions are based on the following scale:</p>
+        <table style="border-collapse: collapse; width: 99%; margin: 20px auto;">
+            <thead>
+                <tr>
+                    <th style="text-align: center; border: 1px solid #dddddd; padding: 6px; font-weight: bold; text-decoration: underline; width: 30%;font-size: 19.3px;">Emoji</th>
+                    <th style="text-align: center; border: 1px solid #dddddd; padding: 6px; font-weight: bold; text-decoration: underline; width: 40%;font-size: 19.3px;text-underline-offset: 4.3px">Percentage of Unreliable News</th>
+                    <th style="text-align: center; border: 1px solid #dddddd; padding: 6px; font-weight: bold; text-decoration: underline; width: 30%;font-size: 19.3px;text-underline-offset: 1.3px">Weather Condition</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td style="text-align: center; border: 1px solid #dddddd; padding: 6px; font-size: 28px;">☀️</td>
+                    <td style="text-align: center; border: 1px solid #dddddd; padding: 6px; font-size: 19.3px;">≤ 10%</td>
+                    <td style="text-align: center; border: 1px solid #dddddd; padding: 6px; font-size: 19.3px;">Sunny</td>
+                </tr>
+                <tr>
+                    <td style="text-align: center; border: 1px solid #dddddd; padding: 6px; font-size: 28px;">🌤️</td>
+                    <td style="text-align: center; border: 1px solid #dddddd; padding: 6px;font-size: 19.3px;">≤ 20%</td>
+                    <td style="text-align: center; border: 1px solid #dddddd; padding: 6px;font-size: 19.3px;">Partly Cloudy</td>
+                </tr>
+                <tr>
+                    <td style="text-align: center; border: 1px solid #dddddd; padding: 6px; font-size: 28px;">⛅️</td>
+                    <td style="text-align: center; border: 1px solid #dddddd; padding: 6px;font-size: 19.3px;">≤ 30%</td>
+                    <td style="text-align: center; border: 1px solid #dddddd; padding: 6px;font-size: 19.3px;">Mostly Cloudy</td>
+                </tr>
+                <tr>
+                    <td style="text-align: center; border: 1px solid #dddddd; padding: 6px; font-size: 28px;">☁️</td>
+                    <td style="text-align: center; border: 1px solid #dddddd; padding: 6px;font-size: 19.3px;">≤ 40%</td>
+                    <td style="text-align: center; border: 1px solid #dddddd; padding: 6px;font-size: 19.3px;">Cloudy</td>
+                </tr>
+                <tr>
+                    <td style="text-align: center; border: 1px solid #dddddd; padding: 6px; font-size: 28px;">🌦️</td>
+                    <td style="text-align: center; border: 1px solid #dddddd; padding: 6px;font-size: 19.3px;">≤ 50%</td>
+                    <td style="text-align: center; border: 1px solid #dddddd; padding: 6px;font-size: 19.3px;">Showers</td>
+                </tr>
+                <tr>
+                    <td style="text-align: center; border: 1px solid #dddddd; padding: 6px; font-size: 28px;">🌧️</td>
+                    <td style="text-align: center; border: 1px solid #dddddd; padding: 6px;font-size: 19.3px;">≤ 60%</td>
+                    <td style="text-align: center; border: 1px solid #dddddd; padding: 6px;font-size: 19.3px;">Rainy</td>
+                </tr>
+                <tr>
+                    <td style="text-align: center; border: 1px solid #dddddd; padding: 6px; font-size: 28px;">🌩️</td>
+                    <td style="text-align: center; border: 1px solid #dddddd; padding: 6px;font-size: 19.3px;">≤ 70%</td>
+                    <td style="text-align: center; border: 1px solid #dddddd; padding: 6px;font-size: 19.3px;">Thunderstorm</td>
+                </tr>
+                <tr>
+                    <td style="text-align: center; border: 1px solid #dddddd; padding: 6px; font-size: 28px;">⛈️</td>
+                    <td style="text-align: center; border: 1px solid #dddddd; padding: 6px;font-size: 19.3px;">≤ 80%</td>
+                    <td style="text-align: center; border: 1px solid #dddddd; padding: 6px;font-size: 19.3px;">Heavy Thunderstorm</td>
+                </tr>
+                <tr>
+                    <td style="text-align: center; border: 1px solid #dddddd; padding: 6px; font-size: 28px;">🌨️</td>
+                    <td style="text-align: center; border: 1px solid #dddddd; padding: 6px;font-size: 19.3px;">≤ 90%</td>
+                    <td style="text-align: center; border: 1px solid #dddddd; padding: 6px;font-size: 19.3px;">Snowy</td>
+                </tr>
+                <tr>
+                    <td style="text-align: center; border: 1px solid #dddddd; padding: 6px; font-size: 28px;">🌪️</td>
+                    <td style="text-align: center; border: 1px solid #dddddd; padding: 6px;font-size: 19.3px;">≤ 100%</td>
+                    <td style="text-align: center; border: 1px solid #dddddd; padding: 6px;font-size: 19.3px;">Tornado</td>
+                </tr>
+            </tbody>
+        </table>
+    
+    <section>
+        <h2>How do you decide what is reliable or not?</h2>
+        <p>We do not decide what is reliable or not. Instead, we rely on a third-party assessment by <a href="https://www.newsguardtech.com/" target="_blank">NewsGuard</a>. Their <a href="https://www.newsguardtech.com/ratings/rating-process-criteria/" target="_blank">rating system</a> is compiled by a team of professional journalists, who assess the credibility and transparency of a news website on a scale from 0 to 100. News websites that score at or above 60 adhere to basic standards of credibility and transparency and are considered reliable, while scores below 60 typically indicate that a news source does not basic journalistic standards and should thus be deemed unreliable.</p>
+    </section>
+
+    <section>
+        <h2>How is the data collected?</h2>
+        <p>We collect data from the <a href="https://docs.bsky.app/docs/advanced-guides/firehose" target="_blank">Bluesky Firehose</a>, which provides a stream of all messages posted by Bluesky users in real time. We only consider posts that include a link to a news website rated by the NewsGuard rating system. This includes all news sources accounting for 95% of online engagement.</p>
+    </section>
+
+    <section>
+        <h2>How often is the chart updated?</h2>
+        <p>A database entry is made every hour, and then the chart is updated immediately after.</p>
+    </section>
+    
+    <section>
+        <h2>How was the visualization developed?</h2>
+        <p>The visualization is created using <a href="https://shiny.posit.co/" target="_blank">Shiny</a> and <a href="https://lets-plot.org/" target="_blank">lets_plot</a>. The data is stored in a <a href="https://www.postgresql.org/" target="_blank">PostgreSQL</a> database, and we use <a href="https://pandas.pydata.org/" target="_blank">Pandas</a> for data processing and transformation.</p>
+    </section>
+
+    <section>
+        <h2>Is the code opensource?</h2>
+        <p>Yes, you can find the code on <a href="https://github.com/CSDL-UMD/bluesky-project" target="_blank">GitHub</a>.</p>
+    </section>
+
+    <section>
+        <h2>Who created MurkySky?</h2>
+        <p>MurkySky is a project of the Computational Sociodynamics Lab at the University of Maryland. <a href="https://www.linkedin.com/in/vikasreddy85/" target="_blank">Vikas Reddy</a> developed the web app frontend and the data collection backend, under the coordination of <a href="https://www.glciampaglia.com/" target="_blank">Giovanni Luca Ciampaglia</a>.</p>
+    </section>
+
+    <section>
+        <h2>What influenced the creation of MurkySky?</h2>
+        <p>The <a href="https://csmr.umich.edu/projects/iffy-quotient/" target="_blank">Iffy Quotient</a> project has played a significant role in shaping our project, and their commitment to transparency and accuracy has greatly influenced our project's direction.
+        </p>
+    </section>
+    <section>
+        <hr>
+   	<div style="display: flex; align-items: center; justify-content: center; gap: 0;">
+            <div style="display: flex; align-items: center; justify-content: center; gap: 0;">
+                <img src="https://umd-brand.transforms.svdcdn.com/production/uploads/images/informal-seal.png?w=512&h=512&auto=compress%2Cformat&fit=crop&dm=1656362660&s=f147c43be06ac2a530c41260819e63a1" alt="University of Maryland Logo" style="height: 4%; width: 4%; margin-right: 20px; margin-bottom: 7px;">
+                <span>Copyright © 2024. Computational Social Dynamics Lab.</span>
+            </div>
+        </div> 
+    </section>
+    
+</body>
+</html>
