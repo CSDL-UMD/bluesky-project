@@ -79,9 +79,15 @@ def get_initial_files(directory, start_from=None):
     for root, _, files in os.walk(directory):
         if os.path.abspath(PROCESSED_DIR) in os.path.abspath(root):
             continue
+            
         for f in files:
             if f.endswith('.gz') or f.endswith('.json'):
-                all_files.append(os.path.join(root, f))
+                original_path = os.path.join(root, f)                
+                processed_name = "processed_" + f
+                processed_path = os.path.join(PROCESSED_DIR, processed_name)
+                
+                if not os.path.exists(processed_path):
+                    all_files.append(original_path)
     
     all_files.sort()
     if start_from:
@@ -89,7 +95,7 @@ def get_initial_files(directory, start_from=None):
             idx = next(i for i, f in enumerate(all_files) if start_from in f)
             return all_files[idx:]
         except StopIteration:
-            print(f"[!] Starting file containing '{start_from}' not found. Processing nothing.")
+            print(f"[!] Starting file containing '{start_from}' not found or already processed.")
             return []
     return all_files
 

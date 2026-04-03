@@ -1,7 +1,7 @@
 Payload
 NewsGuard
 Messages
-
+analysis
 # Preprint Results
 Gephi_Like
 Gephi_Repost
@@ -17,7 +17,17 @@ unshorten-fast
 api_errors.log
 shorturl-services-list.csv
 
-#Env
+#Envsw
 venv
 env
 .env
+
+#weights
+narratives/embedding_model/specious_model_weights.pt
+narratives/scikit-learn
+narratives/embedding_model
+narratives/clusters
+narratives/db
+narratives/chroma.log
+narratives/scheduler.log
+narratives/watchdog.log
