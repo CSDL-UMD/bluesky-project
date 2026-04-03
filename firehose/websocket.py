@@ -1,97 +1,41 @@
-import json, asyncio, websockets, os, logging, gzip, time
-from datetime import datetime
-from collections import deque
+import asyncio
+import websockets
+import os
+import logging
+import aio_pika
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-current_day_folder = None
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
-def ensure_daily_folder():
-    """
-    Ensures that a folder for the current day exists under the './Payload' directory.
-    If the folder for today doesn't exist, it creates one.
+RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://localhost/")
+BSKY_URL = "wss://jetstream1.us-east.bsky.network/subscribe?wantedCollections=app.bsky.feed.post&wantedCollections=app.bsky.feed.like&wantedCollections=app.bsky.feed.repost"
 
-    Returns:
-        str: The path of the current day's folder.
-    """
-    global current_day_folder
-    today = datetime.now().strftime('%Y-%m-%d')
-    new_folder_path = f"./Payload/{today}"
-    if current_day_folder != new_folder_path:
-        if not os.path.exists(new_folder_path):
-            os.makedirs(new_folder_path)
-        current_day_folder = new_folder_path
-    return current_day_folder
+async def connect_and_collect():
+    connection = await aio_pika.connect_robust(RABBITMQ_URL)
+    async with connection:
+        channel = await connection.channel()
+        queue = await channel.declare_queue("raw_events", durable=True)
+        exchange = channel.default_exchange
 
-async def connect_and_collect(queue, url="wss://jetstream1.us-east.bsky.network/subscribe?wantedCollections=app.bsky.feed.post&wantedCollections=app.bsky.feed.like&wantedCollections=app.bsky.feed.repost"):
-    """
-    Connects to a WebSocket server, subscribes to post, repost, and like collections, and collects messages.
-    Puts the collected messages into the provided queue.
-
-    Parameters:
-        queue (asyncio.Queue): The queue to store the collected messages.
-        url (str, optional): The WebSocket URL to connect to. Defaults to the provided default URL.
-    """
-    while True:
-        try:
-            async with websockets.connect(url) as websocket:
-                while True:
-                    try:
-                        message = await websocket.recv()
+        while True:
+            try:
+                async with websockets.connect(BSKY_URL) as websocket:
+                    logging.info("Connected to Bluesky Jetstream")
+                    while True:
                         try:
-                            message_json = json.loads(message)
-                            await queue.put(message_json)
-                        except json.JSONDecodeError:
-                            logging.warning("Failed to decode message JSON")
-                    except websockets.ConnectionClosed:
-                        logging.warning("WebSocket connection closed")
-                        break
-        except Exception as e:
-            logging.error(f"WebSocket error: {e}")
-
-async def compress_periodically(queue, interval=3600):
-    """
-    Compresses the messages collected in the queue and writes them to a `.json.gz` file every hour.
-
-    Parameters:
-        queue (asyncio.Queue): The queue to collect messages from.
-        interval (int, optional): The interval in seconds to wait before compressing. Defaults to 1 hour.
-    """
-    while True:      
-        buffer = deque()
-        start_time = time.time()
-
-        while (time.time() - start_time) < interval:
-            try:
-                message = await asyncio.wait_for(queue.get(), timeout=interval - (time.time() - start_time))
-                buffer.append(message)
-            except asyncio.TimeoutError:
-                continue
-
-        if buffer:
-            folder_path = ensure_daily_folder()
-            timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-            filename = f"{timestamp}.json.gz"
-            full_path = os.path.join(folder_path, filename)  
-            try:
-               with gzip.open(full_path, 'wt', encoding='utf-8') as f:
-                for obj in buffer:
-                    obj_json = json.dumps(obj, ensure_ascii=False, separators=(',', ':'))
-                    f.write(obj_json + '\n')
+                            message = await websocket.recv()
+                            await exchange.publish(
+                                aio_pika.Message(
+                                    body=message.encode(),
+                                    delivery_mode=aio_pika.DeliveryMode.PERSISTENT
+                                ),
+                                routing_key="raw_events"
+                            )
+                        except websockets.ConnectionClosed:
+                            logging.warning("WebSocket connection closed, reconnecting...")
+                            break
             except Exception as e:
-                logging.error(f"Compression error: {e}")
-        while not queue.empty():
-            queue.get_nowait()
-
-async def main():
-    """
-    Initializes an asyncio queue and runs the connection and compression tasks.
-    """
-    queue = asyncio.Queue()
-    await asyncio.gather(connect_and_collect(queue), compress_periodically(queue))
+                logging.error(f"Connection error: {e}. Retrying in 5s...")
+                await asyncio.sleep(5)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logging.info("Script terminated by user")
-
+    asyncio.run(connect_and_collect())
