@@ -1,14 +1,32 @@
 import os
+import sys
+
+CPU_COUNT = os.cpu_count() or 4
+
+os.environ["OMP_NUM_THREADS"]        = str(CPU_COUNT)
+os.environ["MKL_NUM_THREADS"]        = str(CPU_COUNT)
+os.environ["OPENBLAS_NUM_THREADS"]   = str(CPU_COUNT)
+os.environ["VECLIB_MAXIMUM_THREADS"] = str(CPU_COUNT)
+os.environ["NUMEXPR_NUM_THREADS"]    = str(CPU_COUNT)
+
 import json
 import time
 import re
 import math
 from collections import Counter, defaultdict
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 
 from sklearn.cluster import DPMeans
 import database
+
+try:
+    from langdetect import detect, DetectorFactory
+    DetectorFactory.seed = 42
+    _HAS_LANGDETECT = True
+except ImportError:
+    _HAS_LANGDETECT = False
 
 try:
     import nltk
@@ -27,7 +45,7 @@ except ImportError:
 SIGNAL_FILE = "./clusters/.analysis_needed"
 LOCK_FILE   = "./clusters/.analysis_running"
 
-_STOPS = {
+_STOPS = frozenset({
     "the","and","for","that","this","with","are","was","were","have","has",
     "had","but","not","you","they","from","its","our","your","their","about",
     "will","can","been","more","also","when","than","then","who","what","how",
@@ -35,36 +53,100 @@ _STOPS = {
     "did","she","him","her","his","dont","isnt","cant","wont","would","could",
     "should","may","might","let","way","now","here","very","really","like",
     "even","still","after","over","back","only","think","know","make","take",
-}
+})
 
+_WORD_RE    = re.compile(r"\b[a-zA-Z]{3,}\b")
 _SENT_SPLIT = re.compile(r'(?<=[.!?])\s+(?=[A-Z])')
 
 
-def _tok(text):
-    return [w for w in re.findall(r"\b[a-zA-Z]{3,}\b", text.lower()) if w not in _STOPS]
+def _is_english(text: str) -> bool:
+    if not _HAS_LANGDETECT:
+        return True
+    try:
+        return detect(text[:500]) == "en"
+    except Exception:
+        return False
 
 
-def pmi_keywords(cluster_texts, all_text_tokens, top_n=10):
-    ct = [w for t in cluster_texts for w in _tok(t)]
-    if not ct or not all_text_tokens:
+def _tok(text: str) -> list[str]:
+    return [w for w in _WORD_RE.findall(text.lower()) if w not in _STOPS]
+
+
+def _tok_batch(texts: list[str]) -> list[str]:
+    out = []
+    for t in texts:
+        out.extend(_tok(t))
+    return out
+
+
+def pmi_keywords(
+    cluster_tokens: list[str],
+    all_tokens: list[str],
+    background_counter: Counter,
+    top_n: int = 10,
+) -> list[str]:
+    if not cluster_tokens or not all_tokens:
         return []
 
-    cf = Counter(ct)
-    bf = Counter(all_text_tokens)
-    N_c = len(ct)
-    N_b = len(all_text_tokens)
+    cf      = Counter(cluster_tokens)
+    N_c     = len(cluster_tokens)
+    N_b     = len(all_tokens)
+    inv_N_c = 1.0 / N_c
+    inv_N_b = 1.0 / N_b
 
     scores = {
-        w: math.log2((cf[w] / N_c) / (bf.get(w, 1) / N_b) + 1e-9)
+        w: math.log2((c * inv_N_c) / (background_counter.get(w, 1) * inv_N_b) + 1e-9)
         for w, c in cf.items() if c >= 2
     }
-    return [w for w, _ in sorted(scores.items(), key=lambda x: -x[1])][:top_n]
+    return sorted(scores, key=scores.__getitem__, reverse=True)[:top_n]
 
 
-def _closest_to_centroid(member_embeddings, members):
-    centroid  = member_embeddings.mean(axis=0)
+def _closest_to_centroid(member_embeddings: np.ndarray, members: list) -> dict:
+    centroid  = member_embeddings.mean(axis=0, keepdims=True)
     distances = np.linalg.norm(member_embeddings - centroid, axis=1)
     return members[int(np.argmin(distances))]
+
+
+def _process_cluster(args: tuple) -> dict:
+    cid, members, member_embeddings_list, cluster_tokens, all_tokens, background_counter, has_sumy = args
+    member_embeddings = np.array(member_embeddings_list, dtype=np.float32)
+
+    keywords = pmi_keywords(cluster_tokens, all_tokens, background_counter)
+
+    final_summary = ""
+    if has_sumy:
+        try:
+            lexrank       = LexRankSummarizer()
+            cluster_texts = [m["text"] for m in members]
+            joined        = " ".join(cluster_texts)[:50_000]
+            parser        = PlaintextParser.from_string(joined, Tokenizer("english"))
+            doc_sents     = list(parser.document.sentences)
+            if doc_sents:
+                sents         = lexrank(parser.document, min(2, len(doc_sents)))
+                final_summary = " ".join(str(s) for s in sents)
+        except Exception:
+            pass
+
+    if not final_summary.strip():
+        closest       = _closest_to_centroid(member_embeddings, members)
+        final_summary = " ".join(_SENT_SPLIT.split(closest["text"])[:2])
+
+    ng_scores = np.array(
+        [m["newsguard_score"] for m in members
+         if m["newsguard_score"] is not None and m["newsguard_score"] >= 0],
+        dtype=np.float32,
+    )
+
+    return {
+        "cid":          cid,
+        "summary":      final_summary,
+        "keywords":     keywords,
+        "ng_scores":    ng_scores,
+        "total_likes":  sum(m["likeCount"]   for m in members),
+        "total_reposts":sum(m["repostCount"] for m in members),
+        "domains":      sorted({m["domain"]  for m in members if m["domain"]}),
+        "members":      members,
+    }
 
 
 def run_analysis_job():
@@ -75,84 +157,103 @@ def run_analysis_job():
     open(LOCK_FILE, "w").close()
 
     try:
-        print(f"\n[{datetime.now()}] [Analysis] Starting narrative generation pass...", flush=True)
+        t0 = time.time()
+        print(f"\n[{datetime.now()}] [Analysis] Starting...", flush=True)
 
         articles = database.get_all_articles()
-        if len(articles) < 1:
-            print("[Analysis] Insufficient data for clustering. Aborting.", flush=True)
+        if len(articles) < 2:
+            print("[Analysis] Insufficient data. Aborting.", flush=True)
+            return
+
+        articles = [a for a in articles if _is_english(a["text"])]
+        print(f"[Analysis] {len(articles):,} English articles after language filter.", flush=True)
+
+        if len(articles) < 2:
+            print("[Analysis] Insufficient English articles. Aborting.", flush=True)
             return
 
         texts      = [a["text"] for a in articles]
-        all_tokens = [w for t in texts for w in _tok(t)]
+        chunk_size = max(1, len(texts) // CPU_COUNT)
+        chunks     = [texts[i:i + chunk_size] for i in range(0, len(texts), chunk_size)]
+
+        with ThreadPoolExecutor(max_workers=CPU_COUNT) as pool:
+            token_chunks = list(pool.map(_tok_batch, chunks))
+
+        all_tokens         = [tok for chunk in token_chunks for tok in chunk]
+        background_counter = Counter(all_tokens)
+
         embeddings = np.array([a["embedding"] for a in articles], dtype=np.float32)
 
-        print("[Analysis] Running DPMeans...", flush=True)
+        print(f"[Analysis] Running DPMeans on {len(embeddings):,} embeddings...", flush=True)
         dp = DPMeans(delta=0.20, n_init=3, max_iter=100, random_state=42)
         dp.fit(embeddings)
         labels = dp.labels_
 
-        if len(set(labels)) < 2 and len(articles) >= 2:
+        n_clusters = len(set(labels))
+        print(f"[Analysis] {n_clusters} clusters found.", flush=True)
+
+        if n_clusters < 2 and len(articles) >= 2:
             print("[Analysis] DPMeans < 2 clusters — falling back to KMeans(n=2).", flush=True)
             from sklearn.cluster import KMeans
-            labels = KMeans(n_clusters=2, random_state=42, n_init=10).fit_predict(embeddings)
+            labels = KMeans(
+                n_clusters=2, random_state=42, n_init=10
+            ).fit_predict(embeddings)
 
-        clusters: dict[int, list] = defaultdict(list)
+        clusters:     dict[int, list] = defaultdict(list)
         cluster_embs: dict[int, list] = defaultdict(list)
+        cluster_toks: dict[int, list] = defaultdict(list)
+
         for art, emb, lbl in zip(articles, embeddings, labels):
-            clusters[int(lbl)].append(art)
-            cluster_embs[int(lbl)].append(emb)
+            lbl = int(lbl)
+            clusters[lbl].append(art)
+            cluster_embs[lbl].append(emb)
 
-        print(f"[Analysis] {len(clusters)} clusters found.", flush=True)
+        for lbl, members in clusters.items():
+            cluster_toks[lbl] = _tok_batch([m["text"] for m in members])
 
-        if _HAS_SUMY:
-            lexrank = LexRankSummarizer()
+        print(f"[Analysis] Computing PMI + summaries for {len(clusters)} clusters in parallel...", flush=True)
+
+        cluster_args = [
+            (
+                cid,
+                members,
+                cluster_embs[cid],
+                cluster_toks[cid],
+                all_tokens,
+                background_counter,
+                _HAS_SUMY,
+            )
+            for cid, members in clusters.items()
+            if members
+        ]
+
+        results_map: dict[int, dict] = {}
+        with ThreadPoolExecutor(max_workers=min(CPU_COUNT, len(cluster_args))) as pool:
+            futs = {pool.submit(_process_cluster, a): a for a in cluster_args}
+            for fut in as_completed(futs):
+                try:
+                    r = fut.result()
+                    results_map[r["cid"]] = r
+                except Exception as e:
+                    print(f"[Analysis] Cluster processing error: {e}", flush=True)
 
         reliable_threshold = 60.0
         narratives         = []
 
         for cid, members in clusters.items():
-            if not members:
+            if not members or cid not in results_map:
                 continue
-
-            member_embeddings = np.array(cluster_embs[cid], dtype=np.float32)
-            cluster_texts     = [m["text"] for m in members]
-            keywords          = pmi_keywords(cluster_texts, all_tokens)
-
-            final_summary = ""
-            if _HAS_SUMY:
-                try:
-                    parser    = PlaintextParser.from_string(
-                        " ".join(cluster_texts), Tokenizer("english")
-                    )
-                    doc_sents = list(parser.document.sentences)
-                    if doc_sents:
-                        sents = lexrank(parser.document, min(2, len(doc_sents)))
-                        final_summary = " ".join(str(s) for s in sents)
-                except Exception:
-                    pass
-
-            if not final_summary.strip():
-                closest       = _closest_to_centroid(member_embeddings, members)
-                final_summary = " ".join(_SENT_SPLIT.split(closest["text"])[:2])
-
-            ng_scores = np.array(
-                [m["newsguard_score"] for m in members
-                 if m["newsguard_score"] is not None and m["newsguard_score"] >= 0],
-                dtype=np.float32,
-            )
-            total_likes   = sum(m["likeCount"]   for m in members)
-            total_reposts = sum(m["repostCount"] for m in members)
-            domains       = sorted({m["domain"]  for m in members if m["domain"]})
-
+            r         = results_map[cid]
+            ng_scores = r["ng_scores"]
             narratives.append({
-                "narrative_id":        int(cid),
+                "narrative_id":        cid,
                 "size":                len(members),
-                "summary":             final_summary,
-                "pmi_keywords":        keywords,
+                "summary":             r["summary"],
+                "pmi_keywords":        r["keywords"],
                 "avg_newsguard_score": round(float(np.mean(ng_scores)), 2) if len(ng_scores) else None,
-                "total_likes":         total_likes,
-                "total_reposts":       total_reposts,
-                "domains_cited":       domains,
+                "total_likes":         r["total_likes"],
+                "total_reposts":       r["total_reposts"],
+                "domains_cited":       r["domains"],
                 "articles": [
                     {
                         "url":             m["url"],
@@ -184,7 +285,7 @@ def run_analysis_job():
                 json.dump(
                     {
                         "metadata": {
-                            "generated_at":    datetime.now().isoformat(),
+                            "generated_at":     datetime.now().isoformat(),
                             "total_narratives": len(data),
                         },
                         "narratives": data,
@@ -196,7 +297,7 @@ def run_analysis_job():
         _save("./clusters/unreliable_narratives_latest.json", "unreliable", unrel_narrs)
         _save("./clusters/unrated_narratives_latest.json",    "unrated",    unrated_narrs)
 
-        print("[Analysis] Pass complete.", flush=True)
+        print(f"[Analysis] Pass complete in {time.time() - t0:.1f}s.", flush=True)
 
     finally:
         try:

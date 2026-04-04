@@ -1,11 +1,27 @@
 import os
+import sys
+
+CPU_COUNT = os.cpu_count() or 4
+
+os.environ["TOKENIZERS_PARALLELISM"]        = "false"
+os.environ["TRANSFORMERS_VERBOSITY"]        = "error"
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+os.environ["OMP_NUM_THREADS"]               = str(CPU_COUNT)
+os.environ["MKL_NUM_THREADS"]               = str(CPU_COUNT)
+os.environ["OPENBLAS_NUM_THREADS"]          = str(CPU_COUNT)
+os.environ["VECLIB_MAXIMUM_THREADS"]        = str(CPU_COUNT)
+os.environ["NUMEXPR_NUM_THREADS"]           = str(CPU_COUNT)
+
 import json
 import time
 import gzip
 import re
 import types
-import sys
+import threading
+import asyncio
+import aiohttp
 import requests
+from queue import Queue, Empty
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from watchdog.observers import Observer
@@ -21,39 +37,78 @@ try:
 except ImportError:
     _HAS_LANGDETECT = False
 
-os.environ["TRANSFORMERS_VERBOSITY"]        = "error"
-os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-os.environ["TOKENIZERS_PARALLELISM"]        = "false"
+try:
+    import lxml.html as _lxml_html
+    _HAS_LXML = True
+except Exception:
+    _HAS_LXML = False
 
-FETCH_WORKERS    = 8
-EMBED_BATCH_SIZE = 32
-INSERT_BATCH_SIZE = 64
+FETCH_WORKERS    = 256
+EMBED_BATCH_SIZE = 16
+FETCH_QUEUE_MAX  = 1024
+EMBED_QUEUE_MAX  = 128
+MAX_TEXT_CHARS   = 3000
+FETCH_TIMEOUT    = 4
+RESOLVE_WORKERS  = 128
 
-_BOILERPLATE = [
+_BOILERPLATE_SET = frozenset([
     "please enable javascript", "all rights reserved", "terms of service",
     "privacy policy", "about press copyright", "contact us creators",
     "how youtube works", "test new features", "©", "subscribe to our newsletter",
     "disable any ad blockers", "browser extension", "supported browsers",
-]
-_SENT_SPLIT = re.compile(r'(?<=[.!?])\s+(?=[A-Z])')
+])
+_SENT_SPLIT  = re.compile(r'(?<=[.!?])\s+(?=[A-Z])')
+_MULTI_SPACE = re.compile(r'\s+')
 
 SIGNAL_FILE      = "./clusters/.analysis_needed"
 ANALYSIS_EVERY_N = 24
 
-def clean_article_text(text, min_len=60):
+_embedding_module = None
+_http_session: requests.Session = None
+
+
+def _get_session() -> requests.Session:
+    global _http_session
+    if _http_session is None:
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=FETCH_WORKERS,
+            pool_maxsize=FETCH_WORKERS * 2,
+            max_retries=0,
+        )
+        s = requests.Session()
+        s.mount("http://",  adapter)
+        s.mount("https://", adapter)
+        s.headers.update({
+            "User-Agent": "Mozilla/5.0",
+            "Accept-Encoding": "gzip, deflate",
+            "Connection": "keep-alive",
+        })
+        _http_session = s
+    return _http_session
+
+
+def clean_article_text(text: str, min_len: int = 60) -> str | None:
     if not text:
         return None
+    text = text[:MAX_TEXT_CHARS * 3]
     if _HAS_LANGDETECT:
         try:
-            if detect(text[:2000]) != "en":
+            if detect(text[:500]) != "en":
                 return None
         except Exception:
             return None
     valid_sents = []
+    total_chars = 0
     for sent in _SENT_SPLIT.split(text):
-        sent = sent.strip()
-        if len(sent) >= min_len and not any(bp in sent.lower() for bp in _BOILERPLATE):
-            valid_sents.append(sent)
+        sent = _MULTI_SPACE.sub(" ", sent).strip()
+        if len(sent) < min_len:
+            continue
+        if any(bp in sent.lower() for bp in _BOILERPLATE_SET):
+            continue
+        valid_sents.append(sent)
+        total_chars += len(sent)
+        if total_chars >= MAX_TEXT_CHARS:
+            break
     return " ".join(valid_sents) if valid_sents else None
 
 
@@ -65,10 +120,13 @@ except ImportError as e:
     sys.exit(1)
 
 import torch
+torch.set_num_threads(CPU_COUNT)
+torch.set_num_interop_threads(max(1, CPU_COUNT // 2))
 
 
 def load_embedding_model(embed_dir: str, weights_path: str):
-    device    = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    global _embedding_module
+    device    = torch.device("cpu")
     embed_dir = os.path.abspath(embed_dir)
     if embed_dir not in sys.path:
         sys.path.insert(0, embed_dir)
@@ -80,15 +138,29 @@ def load_embedding_model(embed_dir: str, weights_path: str):
         f"torch.load('{weights_path}', map_location=device, weights_only=False)",
         source,
     )
-    source = source.replace(
-        "device = torch.device('cpu')",
-        "device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')",
-    )
     mod          = types.ModuleType("embeddings")
     mod.__file__ = src_path
     sys.modules["embeddings"] = mod
     exec(compile(source, src_path, "exec"), mod.__dict__)
-    return mod.get_sentence_embeddings, mod.model
+
+    _embedding_module = mod
+    embed_fn = mod.get_sentence_embeddings
+    model    = mod.model
+
+    if hasattr(model, "eval"):
+        model.eval()
+
+    try:
+        model = torch.compile(model, backend="inductor", mode="reduce-overhead")
+        print("[Watchdog] torch.compile succeeded (inductor).", flush=True)
+    except Exception:
+        try:
+            model = torch.compile(model)
+            print("[Watchdog] torch.compile succeeded (default).", flush=True)
+        except Exception:
+            print("[Watchdog] torch.compile unavailable, running eager.", flush=True)
+
+    return embed_fn, model
 
 
 def _normalise_domain(raw: str) -> str:
@@ -99,17 +171,16 @@ def _normalise_domain(raw: str) -> str:
 
 
 def load_shortener_domains(csv_path: str) -> set:
+    import pandas as pd
     shorteners = set()
     if not os.path.exists(csv_path):
         return shorteners
-
     try:
         df = pd.read_csv(csv_path, header=None)
         for val in df[0].dropna():
             shorteners.add(_normalise_domain(str(val)))
     except Exception:
         pass
-    
     return shorteners
 
 
@@ -130,19 +201,20 @@ def load_newsguard(newsguard_dir: str) -> dict:
     return mapping
 
 
-def fetch_article_text(url: str, timeout: int = 10):
+def _extract_text_lxml(html: str) -> str | None:
     try:
-        dl = trafilatura.fetch_url(url)
-        if dl:
-            ext = trafilatura.extract(dl, include_comments=False, include_tables=False)
-            if ext:
-                return ext
+        doc   = _lxml_html.fromstring(html)
+        paras = doc.xpath("//p")
+        texts = [p.text_content().strip() for p in paras]
+        out   = "\n".join(t for t in texts if len(t) > 60)
+        return out or None
     except Exception:
-        pass
+        return None
+
+
+def _extract_text_bs4(html: str) -> str | None:
     try:
-        r = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
+        soup = BeautifulSoup(html, "html.parser")
         for tag in soup(["script", "style", "nav", "header", "footer", "aside"]):
             tag.decompose()
         paras = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
@@ -151,32 +223,81 @@ def fetch_article_text(url: str, timeout: int = 10):
         return None
 
 
-def resolve_short_urls_concurrently(urls: set, timeout: int = 5, workers: int = 20) -> dict:
+def fetch_article_text(url: str, timeout: int = FETCH_TIMEOUT) -> str | None:
+    try:
+        session = _get_session()
+        r = session.get(url, timeout=timeout, stream=False)
+        r.raise_for_status()
+        html = r.text
+        result = (_extract_text_lxml(html) if _HAS_LXML else None) or _extract_text_bs4(html)
+        if result:
+            return result
+    except Exception:
+        pass
+
+    try:
+        dl = trafilatura.fetch_url(url, no_ssl=True)
+        if dl:
+            ext = trafilatura.extract(
+                dl,
+                include_comments=False,
+                include_tables=False,
+                no_fallback=False,
+                favor_precision=True,
+            )
+            if ext:
+                return ext
+    except Exception:
+        pass
+
+    return None
+
+
+async def _async_resolve(
+    session: aiohttp.ClientSession, url: str, timeout: int
+) -> tuple[str, str]:
+    try:
+        t = aiohttp.ClientTimeout(total=timeout)
+        async with session.head(url, allow_redirects=True, timeout=t) as r:
+            if r.status == 405:
+                async with session.get(url, allow_redirects=True, timeout=t) as r2:
+                    return url, str(r2.url)
+            return url, str(r.url)
+    except Exception:
+        return url, url
+
+
+async def _resolve_all_async(urls: list[str], timeout: int = 4) -> dict:
+    connector = aiohttp.TCPConnector(limit=RESOLVE_WORKERS, ttl_dns_cache=300)
+    headers   = {"User-Agent": "Mozilla/5.0"}
+    async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
+        results = await asyncio.gather(
+            *[_async_resolve(session, u, timeout) for u in urls]
+        )
+    return dict(results)
+
+
+def resolve_short_urls_concurrently(urls: set, timeout: int = 4) -> dict:
     if not urls:
         return {}
-
-    def _resolve(url):
-        try:
-            r = requests.head(
-                url, allow_redirects=True, timeout=(2, timeout),
-                headers={"User-Agent": "Mozilla/5.0"},
-            )
-            if r.status_code == 405:
-                r = requests.get(
-                    url, allow_redirects=True, stream=True, timeout=(2, timeout),
-                    headers={"User-Agent": "Mozilla/5.0"},
-                )
-            return url, r.url
-        except requests.RequestException:
-            return url, url
-
-    resolution_map = {}
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futs = {pool.submit(_resolve, u): u for u in urls}
-        for fut in as_completed(futs):
-            orig, resolved = fut.result()
-            resolution_map[orig] = resolved
-    return resolution_map
+    try:
+        loop   = asyncio.new_event_loop()
+        result = loop.run_until_complete(_resolve_all_async(list(urls), timeout))
+        loop.close()
+        return result
+    except Exception:
+        session = _get_session()
+        def _resolve(url):
+            try:
+                r = session.head(url, allow_redirects=True, timeout=(2, timeout))
+                return url, r.url
+            except Exception:
+                return url, url
+        out = {}
+        with ThreadPoolExecutor(max_workers=RESOLVE_WORKERS) as pool:
+            for orig, resolved in pool.map(_resolve, list(urls)):
+                out[orig] = resolved
+        return out
 
 
 def _signal_analysis():
@@ -205,7 +326,7 @@ class BlueskyHandler(FileSystemEventHandler):
         self.process_file(event.src_path)
 
     def process_file(self, filepath):
-        filename  = os.path.basename(filepath)
+        filename = os.path.basename(filepath)
         if database.is_file_processed(filename):
             print(f"[Watchdog] {filename} already processed. Skipping.", flush=True)
             return
@@ -232,9 +353,8 @@ class BlueskyHandler(FileSystemEventHandler):
 
         resolved_map = resolve_short_urls_concurrently(short_urls_to_resolve)
 
-        seen:       set[str]  = set()
-        candidates: list[dict] = []
-        stat_updates: list[tuple] = []
+        seen:               set[str]  = set()
+        candidates:       list[dict]  = []
         all_candidate_urls: list[str] = []
 
         try:
@@ -282,86 +402,156 @@ class BlueskyHandler(FileSystemEventHandler):
             print(f"[Watchdog] Critical error in pass 2: {e}", flush=True)
             return
 
-        print(
-            f"[Watchdog] {len(candidates):,} candidate URLs collected. "
-            f"Batch-checking existence in ChromaDB...",
-            flush=True,
-        )
+        print(f"[Watchdog] {len(candidates):,} candidates. Checking ChromaDB...", flush=True)
 
-        existing = database.get_existing_urls(all_candidate_urls)
-
-        new_candidates  = [c for c in candidates if c["url"] not in existing]
-        stat_updates    = [
+        existing       = database.get_existing_urls(all_candidate_urls)
+        new_candidates = [c for c in candidates if c["url"] not in existing]
+        stat_updates   = [
             (c["url"], c["likes"], c["reposts"])
             for c in candidates if c["url"] in existing
         ]
 
-        print(
-            f"[Watchdog] {len(existing):,} already in DB (stats will be updated), "
-            f"{len(new_candidates):,} new articles to fetch.",
-            flush=True,
-        )
+        print(f"[Watchdog] {len(existing):,} in DB, {len(new_candidates):,} to fetch.", flush=True)
 
         database.batch_update_stats(stat_updates)
 
+        if not new_candidates:
+            database.mark_file_processed(filename)
+            return
+
+        fetch_queue   = Queue(maxsize=FETCH_QUEUE_MAX)
+        embed_queue   = Queue(maxsize=EMBED_QUEUE_MAX)
+        failed_fetch  = [0]
+        failed_embed  = [0]
+        fetched_count = [0]
+        embed_done    = [0]
+        total         = len(new_candidates)
+        t_start       = time.time()
+        milestones    = {total // 3, (2 * total) // 3, total}
+        logged        = set()
+
         def _fetch_and_clean(cand: dict):
-            raw_text = fetch_article_text(cand["url"])
-            if not raw_text:
+            try:
+                raw = fetch_article_text(cand["url"])
+            except Exception:
                 return None
-            clean_text = clean_article_text(raw_text)
-            if not clean_text:
+            if not raw:
                 return None
-            cand["text"] = clean_text
+            clean = clean_article_text(raw)
+            if not clean:
+                return None
+            cand["text"] = clean
             return cand
 
-        fetched: list[dict] = []
-        failed  = 0
+        def _fetcher_worker():
+            with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as pool:
+                futs = {pool.submit(_fetch_and_clean, c): c for c in new_candidates}
+                for fut in as_completed(futs):
+                    try:
+                        result = fut.result(timeout=FETCH_TIMEOUT + 3)
+                    except Exception:
+                        result = None
+                    if result:
+                        fetched_count[0] += 1
+                        fetch_queue.put(result)
+                    else:
+                        failed_fetch[0] += 1
 
-        with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as pool:
-            futs = {pool.submit(_fetch_and_clean, c): c for c in new_candidates}
-            done = 0
-            for fut in as_completed(futs):
-                done += 1
-                result = fut.result()
-                if result:
-                    fetched.append(result)
-                else:
-                    failed += 1
+                    done = fetched_count[0] + failed_fetch[0]
+                    milestone = min(milestones, key=lambda m: abs(m - done))
+                    if milestone not in logged and abs(milestone - done) <= max(1, total // 100):
+                        logged.add(milestone)
+                        elapsed = time.time() - t_start
+                        rate    = done / elapsed if elapsed > 0 else 0
+                        print(
+                            f"[Watchdog] {done}/{total} fetched "
+                            f"({fetched_count[0]} ok, {failed_fetch[0]} fail) "
+                            f"| {rate:.0f}/s | {embed_done[0]} embedded",
+                            flush=True,
+                        )
+            fetch_queue.put(None)
 
-        embedded: list[dict] = []
-        for batch in _chunked(fetched, EMBED_BATCH_SIZE):
-            texts    = [a["text"] for a in batch]
-            emb_list = self.embed_fn(self.model, texts)
-            for article, emb in zip(batch, emb_list):
-                article["embedding"] = np.array(emb, dtype=np.float32)
-                embedded.append(article)
+        def _batcher_worker():
+            buffer = []
+            while True:
+                try:
+                    item = fetch_queue.get(timeout=30)
+                except Empty:
+                    if buffer:
+                        embed_queue.put(buffer)
+                    embed_queue.put(None)
+                    return
+                if item is None:
+                    if buffer:
+                        embed_queue.put(buffer)
+                    embed_queue.put(None)
+                    return
+                buffer.append(item)
+                if len(buffer) >= EMBED_BATCH_SIZE:
+                    embed_queue.put(buffer)
+                    buffer = []
 
-        total_inserted = 0
-        for batch in _chunked(embedded, INSERT_BATCH_SIZE):
-            db_batch = [
-                {
-                    "url":             a["url"],
-                    "domain":          a["domain"],
-                    "newsguard_score": a["score"],
-                    "text":            a["text"],
-                    "embedding":       a["embedding"],
-                    "did":             a.get("did", ""),
-                    "created_at":      a.get("created_at", ""),
-                    "likeCount":       a.get("likes",   0),
-                    "repostCount":     a.get("reposts", 0),
-                }
-                for a in batch
-            ]
-            database.batch_insert_articles(db_batch)
-            total_inserted += len(db_batch)
+        def _embed_worker():
+            with torch.inference_mode():
+                while True:
+                    try:
+                        batch = embed_queue.get(timeout=60)
+                    except Empty:
+                        break
+                    if batch is None:
+                        break
+                    try:
+                        texts   = [a["text"] for a in batch]
+                        emb_arr = np.asarray(
+                            self.embed_fn(self.model, texts), dtype=np.float32
+                        )
+                        for j, article in enumerate(batch):
+                            article["embedding"] = emb_arr[j]
+                        embed_done[0] += len(batch)
+                        database.batch_insert_articles([
+                            {
+                                "url":             a["url"],
+                                "domain":          a["domain"],
+                                "newsguard_score": a["score"],
+                                "text":            a["text"],
+                                "embedding":       a["embedding"],
+                                "did":             a.get("did", ""),
+                                "created_at":      a.get("created_at", ""),
+                                "likeCount":       a.get("likes",   0),
+                                "repostCount":     a.get("reposts", 0),
+                            }
+                            for a in batch
+                        ])
+                    except Exception as e:
+                        print(f"[Watchdog] Embed/insert batch failed: {e}", flush=True)
+                        failed_embed[0] += len(batch)
 
-        database.mark_file_processed(filename)
         print(
-            f"[Watchdog] {filename} complete — "
-            f"{total_inserted} inserted, {len(stat_updates)} stats updated, "
-            f"{failed} fetch failures.",
+            f"[Watchdog] fetch({FETCH_WORKERS} threads, {FETCH_TIMEOUT}s timeout) → "
+            f"batch({EMBED_BATCH_SIZE}) → embed+insert | {total} articles",
             flush=True,
         )
+
+        t_fetch    = threading.Thread(target=_fetcher_worker, daemon=True)
+        t_batch    = threading.Thread(target=_batcher_worker, daemon=True)
+        t_embed    = threading.Thread(target=_embed_worker,   daemon=True)
+
+        t_fetch.start()
+        t_batch.start()
+        t_embed.start()
+
+        t_fetch.join()
+        t_batch.join()
+        t_embed.join()
+
+        elapsed = time.time() - t_start
+        print(
+            f"[Watchdog] {filename} done in {elapsed:.0f}s — "
+            f"inserted={embed_done[0]}, stats_updated={len(stat_updates)}, "
+            f"fetch_fail={failed_fetch[0]}, embed_fail={failed_embed[0]}",
+            flush=True,
+        )
+        database.mark_file_processed(filename)
 
 
 if __name__ == "__main__":
@@ -371,6 +561,8 @@ if __name__ == "__main__":
     print("[Watchdog] Initializing databases...", flush=True)
     database.init_db()
     database.get_chroma_collection()
+
+    _get_session()
 
     print("[Watchdog] Loading NewsGuard, shorteners, and embedding model...", flush=True)
     ng_map     = load_newsguard("../firehose/NewsGuard")

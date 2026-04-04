@@ -40,11 +40,10 @@ def _chroma_cmd():
 
 def main():
     print("[Orchestrator] Booting pipeline...", flush=True)
-
     os.makedirs("./db/chroma_vector_db", exist_ok=True)
+
     print("[Orchestrator] Launching ChromaDB server...", flush=True)
     chroma, chroma_log = _launch(None, "chroma.log", cmd=_chroma_cmd())
-
     if not _wait_for_chroma():
         print("[Orchestrator] FATAL: ChromaDB server did not start. Check chroma.log.", flush=True)
         sys.exit(1)
@@ -61,7 +60,6 @@ def main():
 
     print("[Orchestrator] Launching Watchdog Daemon...", flush=True)
     watchdog, watchdog_log = _launch("watchdog_daemon.py", "watchdog.log")
-
     time.sleep(5)
 
     print("[Orchestrator] Launching Periodic Analysis Scheduler...", flush=True)
@@ -76,15 +74,12 @@ def main():
                 if not _wait_for_chroma():
                     print("[Orchestrator] FATAL: ChromaDB server failed to recover.", flush=True)
                     sys.exit(1)
-
             if watchdog.poll() is not None:
                 print("[Orchestrator] WARNING: Watchdog Daemon crashed! Restarting...", flush=True)
                 watchdog, watchdog_log = _launch("watchdog_daemon.py", "watchdog.log", watchdog_log)
-
             if scheduler.poll() is not None:
                 print("[Orchestrator] WARNING: Periodic Analysis crashed! Restarting...", flush=True)
                 scheduler, scheduler_log = _launch("periodic_analysis.py", "scheduler.log", scheduler_log)
-
     except KeyboardInterrupt:
         print("\n[Orchestrator] Shutting down all processes...", flush=True)
         watchdog.terminate()

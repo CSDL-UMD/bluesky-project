@@ -125,7 +125,7 @@ def batch_update_stats(updates: list[tuple[str, int, int]]):
             return
         new_metas = []
         for uid, meta in zip(res["ids"], res["metadatas"]):
-            meta = meta or {}
+            meta  = meta or {}
             delta = {u: (l, r) for u, l, r in updates}
             dl, dr = delta.get(uid, (0, 0))
             meta["likeCount"]   = meta.get("likeCount",   0) + dl
