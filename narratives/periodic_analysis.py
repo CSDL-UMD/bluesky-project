@@ -17,12 +17,15 @@ try:
     except LookupError:
         nltk.download("punkt",     quiet=True)
         nltk.download("punkt_tab", quiet=True)
-    from sumy.parsers.plaintext import PlaintextParser
-    from sumy.nlp.tokenizers   import Tokenizer
+    from sumy.parsers.plaintext    import PlaintextParser
+    from sumy.nlp.tokenizers       import Tokenizer
     from sumy.summarizers.lex_rank import LexRankSummarizer
     _HAS_SUMY = True
 except ImportError:
     _HAS_SUMY = False
+
+SIGNAL_FILE = "./clusters/.analysis_needed"
+LOCK_FILE   = "./clusters/.analysis_running"
 
 _STOPS = {
     "the","and","for","that","this","with","are","was","were","have","has",
@@ -36,160 +39,180 @@ _STOPS = {
 
 _SENT_SPLIT = re.compile(r'(?<=[.!?])\s+(?=[A-Z])')
 
-SIGNAL_FILE    = "./clusters/.analysis_needed"
-FIXED_INTERVAL = 30 * 60
-
 
 def _tok(text):
     return [w for w in re.findall(r"\b[a-zA-Z]{3,}\b", text.lower()) if w not in _STOPS]
 
 
-def pmi_keywords(cluster_texts, all_texts, top_n=10):
+def pmi_keywords(cluster_texts, all_text_tokens, top_n=10):
     ct = [w for t in cluster_texts for w in _tok(t)]
-    bt = [w for t in all_texts      for w in _tok(t)]
-    if not ct or not bt:
+    if not ct or not all_text_tokens:
         return []
+
     cf = Counter(ct)
-    bf = Counter(bt)
+    bf = Counter(all_text_tokens)
+    N_c = len(ct)
+    N_b = len(all_text_tokens)
+
     scores = {
-        w: math.log2((cf[w] / len(ct)) / (bf.get(w, 1) / len(bt)) + 1e-9)
+        w: math.log2((cf[w] / N_c) / (bf.get(w, 1) / N_b) + 1e-9)
         for w, c in cf.items() if c >= 2
     }
     return [w for w, _ in sorted(scores.items(), key=lambda x: -x[1])][:top_n]
 
 
-def run_analysis_job():
-    print(f"\n[{datetime.now()}] [Analysis] Starting narrative generation pass...", flush=True)
-    articles = database.get_all_articles()
+def _closest_to_centroid(member_embeddings, members):
+    centroid  = member_embeddings.mean(axis=0)
+    distances = np.linalg.norm(member_embeddings - centroid, axis=1)
+    return members[int(np.argmin(distances))]
 
-    if len(articles) < 1:
-        print("[Analysis] Insufficient data for clustering. Aborting pass.", flush=True)
+
+def run_analysis_job():
+    if os.path.exists(LOCK_FILE):
+        print("[Analysis] Already running. Skipping.", flush=True)
         return
 
-    texts      = [a["text"]      for a in articles]
-    embeddings = np.array([a["embedding"] for a in articles], dtype=np.float32)
+    open(LOCK_FILE, "w").close()
 
-    print("[Analysis] Executing DPMeans clustering...", flush=True)
-    delta = 0.20
-    dp    = DPMeans(delta=delta, n_init=3, max_iter=100, random_state=42)
-    dp.fit(embeddings)
-    labels = dp.labels_
+    try:
+        print(f"\n[{datetime.now()}] [Analysis] Starting narrative generation pass...", flush=True)
 
-    if len(set(labels)) < 2 and len(articles) >= 2:
-        print("[Analysis] DPMeans found < 2 clusters. Falling back to KMeans(n=2).", flush=True)
-        from sklearn.cluster import KMeans
-        km     = KMeans(n_clusters=2, random_state=42, n_init=10)
-        labels = km.fit_predict(embeddings)
+        articles = database.get_all_articles()
+        if len(articles) < 1:
+            print("[Analysis] Insufficient data for clustering. Aborting.", flush=True)
+            return
 
-    clusters: dict = defaultdict(list)
-    for art, lbl in zip(articles, labels):
-        clusters[int(lbl)].append(art)
+        texts      = [a["text"] for a in articles]
+        all_tokens = [w for t in texts for w in _tok(t)]
+        embeddings = np.array([a["embedding"] for a in articles], dtype=np.float32)
 
-    print(f"[Analysis] Grouped articles into {len(clusters)} unique narratives.", flush=True)
+        print("[Analysis] Running DPMeans...", flush=True)
+        dp = DPMeans(delta=0.20, n_init=3, max_iter=100, random_state=42)
+        dp.fit(embeddings)
+        labels = dp.labels_
 
-    if _HAS_SUMY:
-        lexrank_summarizer = LexRankSummarizer()
+        if len(set(labels)) < 2 and len(articles) >= 2:
+            print("[Analysis] DPMeans < 2 clusters — falling back to KMeans(n=2).", flush=True)
+            from sklearn.cluster import KMeans
+            labels = KMeans(n_clusters=2, random_state=42, n_init=10).fit_predict(embeddings)
 
-    narratives         = []
-    reliable_threshold = 60.0
+        clusters: dict[int, list] = defaultdict(list)
+        cluster_embs: dict[int, list] = defaultdict(list)
+        for art, emb, lbl in zip(articles, embeddings, labels):
+            clusters[int(lbl)].append(art)
+            cluster_embs[int(lbl)].append(emb)
 
-    for cid, members in clusters.items():
-        if len(members) < 1:
-            continue
+        print(f"[Analysis] {len(clusters)} clusters found.", flush=True)
 
-        member_embeddings = np.array([m["embedding"] for m in members])
-        cluster_texts     = [m["text"] for m in members]
-        keywords          = pmi_keywords(cluster_texts, texts)
-
-        final_summary = ""
         if _HAS_SUMY:
-            try:
-                cluster_text  = " ".join(cluster_texts)
-                parser        = PlaintextParser.from_string(cluster_text, Tokenizer("english"))
-                doc_sents     = list(parser.document.sentences)
-                extract_count = min(2, len(doc_sents))
-                if extract_count > 0:
-                    summary_sentences = lexrank_summarizer(parser.document, extract_count)
-                    final_summary     = " ".join(str(s) for s in summary_sentences)
-            except Exception:
-                pass
+            lexrank = LexRankSummarizer()
 
-        if not final_summary.strip():
-            centroid     = member_embeddings.mean(axis=0)
-            distances    = np.linalg.norm(member_embeddings - centroid, axis=1)
-            closest_idx  = int(np.argmin(distances))
-            closest_text = members[closest_idx]["text"]
-            final_summary = " ".join(_SENT_SPLIT.split(closest_text)[:2])
+        reliable_threshold = 60.0
+        narratives         = []
 
-        ng_scores = [
-            m["newsguard_score"]
-            for m in members
-            if m["newsguard_score"] is not None and m["newsguard_score"] >= 0
-        ]
-        domains = sorted({m["domain"] for m in members if m["domain"]})
+        for cid, members in clusters.items():
+            if not members:
+                continue
 
-        narratives.append({
-            "narrative_id":        int(cid),
-            "size":                len(members),
-            "summary":             final_summary,
-            "pmi_keywords":        keywords,
-            "avg_newsguard_score": round(float(np.mean(ng_scores)), 2) if ng_scores else None,
-            "total_likes":         sum(m["likeCount"]   for m in members),
-            "total_reposts":       sum(m["repostCount"]  for m in members),
-            "domains_cited":       domains,
-            "articles": [
-                {
-                    "url":             m["url"],
-                    "domain":          m["domain"],
-                    "newsguard_score": m["newsguard_score"],
-                    "likes":           m["likeCount"],
-                }
-                for m in members
-            ],
-        })
+            member_embeddings = np.array(cluster_embs[cid], dtype=np.float32)
+            cluster_texts     = [m["text"] for m in members]
+            keywords          = pmi_keywords(cluster_texts, all_tokens)
 
-    rel_narrs     = [n for n in narratives if n["avg_newsguard_score"] is not None and n["avg_newsguard_score"] >= reliable_threshold]
-    unrel_narrs   = [n for n in narratives if n["avg_newsguard_score"] is not None and n["avg_newsguard_score"] <  reliable_threshold]
-    unrated_narrs = [n for n in narratives if n["avg_newsguard_score"] is None]
+            final_summary = ""
+            if _HAS_SUMY:
+                try:
+                    parser    = PlaintextParser.from_string(
+                        " ".join(cluster_texts), Tokenizer("english")
+                    )
+                    doc_sents = list(parser.document.sentences)
+                    if doc_sents:
+                        sents = lexrank(parser.document, min(2, len(doc_sents)))
+                        final_summary = " ".join(str(s) for s in sents)
+                except Exception:
+                    pass
 
-    rel_narrs.sort(    key=lambda x: x["size"], reverse=True)
-    unrel_narrs.sort(  key=lambda x: x["size"], reverse=True)
-    unrated_narrs.sort(key=lambda x: x["size"], reverse=True)
+            if not final_summary.strip():
+                closest       = _closest_to_centroid(member_embeddings, members)
+                final_summary = " ".join(_SENT_SPLIT.split(closest["text"])[:2])
 
-    os.makedirs("./clusters", exist_ok=True)
-
-    def _save(path, label, data):
-        print(f"[Analysis] Saving {len(data)} {label} narratives to disk...", flush=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "metadata":   {"generated_at": datetime.now().isoformat(), "total_narratives": len(data)},
-                    "narratives": data,
-                },
-                f, indent=2, ensure_ascii=False,
+            ng_scores = np.array(
+                [m["newsguard_score"] for m in members
+                 if m["newsguard_score"] is not None and m["newsguard_score"] >= 0],
+                dtype=np.float32,
             )
+            total_likes   = sum(m["likeCount"]   for m in members)
+            total_reposts = sum(m["repostCount"] for m in members)
+            domains       = sorted({m["domain"]  for m in members if m["domain"]})
 
-    _save("./clusters/reliable_narratives_latest.json",   "reliable",   rel_narrs)
-    _save("./clusters/unreliable_narratives_latest.json", "unreliable", unrel_narrs)
-    _save("./clusters/unrated_narratives_latest.json",    "unrated",    unrated_narrs)
+            narratives.append({
+                "narrative_id":        int(cid),
+                "size":                len(members),
+                "summary":             final_summary,
+                "pmi_keywords":        keywords,
+                "avg_newsguard_score": round(float(np.mean(ng_scores)), 2) if len(ng_scores) else None,
+                "total_likes":         total_likes,
+                "total_reposts":       total_reposts,
+                "domains_cited":       domains,
+                "articles": [
+                    {
+                        "url":             m["url"],
+                        "domain":          m["domain"],
+                        "newsguard_score": m["newsguard_score"],
+                        "likes":           m["likeCount"],
+                    }
+                    for m in members
+                ],
+            })
 
-    print("[Analysis] Pass complete. Waiting for next cycle.", flush=True)
+        def _sort(lst):
+            return sorted(lst, key=lambda x: x["size"], reverse=True)
+
+        rel_narrs     = _sort([n for n in narratives
+                               if n["avg_newsguard_score"] is not None
+                               and n["avg_newsguard_score"] >= reliable_threshold])
+        unrel_narrs   = _sort([n for n in narratives
+                               if n["avg_newsguard_score"] is not None
+                               and n["avg_newsguard_score"] <  reliable_threshold])
+        unrated_narrs = _sort([n for n in narratives
+                               if n["avg_newsguard_score"] is None])
+
+        os.makedirs("./clusters", exist_ok=True)
+
+        def _save(path, label, data):
+            print(f"[Analysis] Saving {len(data)} {label} narratives → {path}", flush=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "metadata": {
+                            "generated_at":    datetime.now().isoformat(),
+                            "total_narratives": len(data),
+                        },
+                        "narratives": data,
+                    },
+                    f, indent=2, ensure_ascii=False,
+                )
+
+        _save("./clusters/reliable_narratives_latest.json",   "reliable",   rel_narrs)
+        _save("./clusters/unreliable_narratives_latest.json", "unreliable", unrel_narrs)
+        _save("./clusters/unrated_narratives_latest.json",    "unrated",    unrated_narrs)
+
+        print("[Analysis] Pass complete.", flush=True)
+
+    finally:
+        try:
+            os.remove(LOCK_FILE)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":
-    print("[Analysis Scheduler] Activated.", flush=True)
-    last_run = 0.0
+    print("[Analysis Worker] Waiting for signals...", flush=True)
     while True:
-        signal_present = os.path.exists(SIGNAL_FILE)
-        time_due       = (time.time() - last_run) >= FIXED_INTERVAL
-
-        if signal_present or time_due:
-            if signal_present:
-                try:
-                    os.remove(SIGNAL_FILE)
-                except OSError:
-                    pass
+        if os.path.exists(SIGNAL_FILE):
+            try:
+                os.remove(SIGNAL_FILE)
+            except OSError:
+                pass
             run_analysis_job()
-            last_run = time.time()
         else:
-            time.sleep(60)
+            time.sleep(5)
