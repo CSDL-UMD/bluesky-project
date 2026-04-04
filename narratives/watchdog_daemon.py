@@ -45,7 +45,7 @@ except Exception:
 
 FETCH_WORKERS    = 256
 EMBED_BATCH_SIZE = 16
-FETCH_QUEUE_MAX  = 1024
+FETCH_QUEUE_MAX  = 0
 EMBED_QUEUE_MAX  = 128
 MAX_TEXT_CHARS   = 3000
 FETCH_TIMEOUT    = 4
@@ -421,6 +421,7 @@ class BlueskyHandler(FileSystemEventHandler):
 
         fetch_queue   = Queue(maxsize=FETCH_QUEUE_MAX)
         embed_queue   = Queue(maxsize=EMBED_QUEUE_MAX)
+        fetcher_done  = threading.Event()
         failed_fetch  = [0]
         failed_embed  = [0]
         fetched_count = [0]
@@ -469,18 +470,21 @@ class BlueskyHandler(FileSystemEventHandler):
                             f"| {rate:.0f}/s | {embed_done[0]} embedded",
                             flush=True,
                         )
+            fetcher_done.set()
             fetch_queue.put(None)
 
         def _batcher_worker():
             buffer = []
             while True:
                 try:
-                    item = fetch_queue.get(timeout=30)
+                    item = fetch_queue.get(timeout=5)
                 except Empty:
-                    if buffer:
-                        embed_queue.put(buffer)
-                    embed_queue.put(None)
-                    return
+                    if fetcher_done.is_set() and fetch_queue.empty():
+                        if buffer:
+                            embed_queue.put(buffer)
+                        embed_queue.put(None)
+                        return
+                    continue
                 if item is None:
                     if buffer:
                         embed_queue.put(buffer)
@@ -532,9 +536,9 @@ class BlueskyHandler(FileSystemEventHandler):
             flush=True,
         )
 
-        t_fetch    = threading.Thread(target=_fetcher_worker, daemon=True)
-        t_batch    = threading.Thread(target=_batcher_worker, daemon=True)
-        t_embed    = threading.Thread(target=_embed_worker,   daemon=True)
+        t_fetch = threading.Thread(target=_fetcher_worker, daemon=True)
+        t_batch = threading.Thread(target=_batcher_worker, daemon=True)
+        t_embed = threading.Thread(target=_embed_worker,   daemon=True)
 
         t_fetch.start()
         t_batch.start()
