@@ -12,6 +12,15 @@ os.environ["OPENBLAS_NUM_THREADS"]          = str(CPU_COUNT)
 os.environ["VECLIB_MAXIMUM_THREADS"]        = str(CPU_COUNT)
 os.environ["NUMEXPR_NUM_THREADS"]           = str(CPU_COUNT)
 
+import ctypes, ctypes.util
+_jemalloc = ctypes.util.find_library("jemalloc")
+if _jemalloc:
+    try:
+        ctypes.CDLL(_jemalloc, mode=ctypes.RTLD_GLOBAL)
+        print("[Watchdog] jemalloc loaded.", flush=True)
+    except OSError:
+        pass
+
 import json
 import time
 import gzip
@@ -43,13 +52,12 @@ try:
 except Exception:
     _HAS_LXML = False
 
-FETCH_WORKERS    = 256
+FETCH_WORKERS    = 32
 EMBED_BATCH_SIZE = 16
-FETCH_QUEUE_MAX  = 0
 EMBED_QUEUE_MAX  = 128
 MAX_TEXT_CHARS   = 3000
 FETCH_TIMEOUT    = 4
-RESOLVE_WORKERS  = 128
+RESOLVE_WORKERS  = 64
 
 _BOILERPLATE_SET = frozenset([
     "please enable javascript", "all rights reserved", "terms of service",
@@ -64,26 +72,33 @@ SIGNAL_FILE      = "./clusters/.analysis_needed"
 ANALYSIS_EVERY_N = 24
 
 _embedding_module = None
-_http_session: requests.Session = None
+_http_session = None
+_http_session_lock = threading.Lock()
+
+
+def _make_session() -> requests.Session:
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=FETCH_WORKERS,
+        pool_maxsize=FETCH_WORKERS,
+        max_retries=0,
+    )
+    s = requests.Session()
+    s.mount("http://",  adapter)
+    s.mount("https://", adapter)
+    s.headers.update({
+        "User-Agent":      "Mozilla/5.0",
+        "Accept-Encoding": "gzip, deflate",
+        "Connection":      "keep-alive",
+    })
+    return s
 
 
 def _get_session() -> requests.Session:
     global _http_session
     if _http_session is None:
-        adapter = requests.adapters.HTTPAdapter(
-            pool_connections=FETCH_WORKERS,
-            pool_maxsize=FETCH_WORKERS * 2,
-            max_retries=0,
-        )
-        s = requests.Session()
-        s.mount("http://",  adapter)
-        s.mount("https://", adapter)
-        s.headers.update({
-            "User-Agent": "Mozilla/5.0",
-            "Accept-Encoding": "gzip, deflate",
-            "Connection": "keep-alive",
-        })
-        _http_session = s
+        with _http_session_lock:
+            if _http_session is None:
+                _http_session = _make_session()
     return _http_session
 
 
@@ -114,7 +129,9 @@ def clean_article_text(text: str, min_len: int = 60) -> str | None:
 
 try:
     import trafilatura
-    from bs4 import BeautifulSoup
+    from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
+    import warnings
+    warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 except ImportError as e:
     print(f"[Watchdog] FATAL: Missing dependency: {e}", flush=True)
     sys.exit(1)
@@ -138,7 +155,7 @@ def load_embedding_model(embed_dir: str, weights_path: str):
         f"torch.load('{weights_path}', map_location=device, weights_only=False)",
         source,
     )
-    mod          = types.ModuleType("embeddings")
+    mod         = types.ModuleType("embeddings")
     mod.__file__ = src_path
     sys.modules["embeddings"] = mod
     exec(compile(source, src_path, "exec"), mod.__dict__)
@@ -149,24 +166,16 @@ def load_embedding_model(embed_dir: str, weights_path: str):
 
     if hasattr(model, "eval"):
         model.eval()
-
-    try:
-        model = torch.compile(model, backend="inductor", mode="reduce-overhead")
-        print("[Watchdog] torch.compile succeeded (inductor).", flush=True)
-    except Exception:
-        try:
-            model = torch.compile(model)
-            print("[Watchdog] torch.compile succeeded (default).", flush=True)
-        except Exception:
-            print("[Watchdog] torch.compile unavailable, running eager.", flush=True)
-
     return embed_fn, model
 
 
 def _normalise_domain(raw: str) -> str:
     raw = raw.strip().lower()
     if raw.startswith("http"):
-        raw = urlparse(raw).netloc
+        try:
+            raw = urlparse(raw).netloc
+        except Exception:
+            return ""
     return re.sub(r"^www\.", "", raw).rstrip("/")
 
 
@@ -187,7 +196,7 @@ def load_shortener_domains(csv_path: str) -> set:
 def load_newsguard(newsguard_dir: str) -> dict:
     import pandas as pd
     meta_path = os.path.join(newsguard_dir, "metadata.csv")
-    mapping: dict = {}
+    mapping = {}
     if not os.path.exists(meta_path):
         return mapping
     df = pd.read_csv(meta_path, low_memory=False, usecols=["Domain", "Score"])
@@ -203,10 +212,11 @@ def load_newsguard(newsguard_dir: str) -> dict:
 
 def _extract_text_lxml(html: str) -> str | None:
     try:
-        doc   = _lxml_html.fromstring(html)
+        doc   = _lxml_html.document_fromstring(html)
         paras = doc.xpath("//p")
         texts = [p.text_content().strip() for p in paras]
         out   = "\n".join(t for t in texts if len(t) > 60)
+        del doc, paras, texts
         return out or None
     except Exception:
         return None
@@ -224,22 +234,30 @@ def _extract_text_bs4(html: str) -> str | None:
 
 
 def fetch_article_text(url: str, timeout: int = FETCH_TIMEOUT) -> str | None:
+    html = None
     try:
         session = _get_session()
-        r = session.get(url, timeout=timeout, stream=False)
+        r = session.get(url, timeout=timeout, stream=True)
         r.raise_for_status()
-        html = r.text
-        result = (_extract_text_lxml(html) if _HAS_LXML else None) or _extract_text_bs4(html)
-        if result:
-            return result
+        content = b""
+        for chunk in r.iter_content(chunk_size=65536):
+            content += chunk
+            if len(content) > 2_000_000:
+                r.close()
+                return None
+        r.close()
+        html = content.decode("utf-8", errors="replace")
+        del content
     except Exception:
         pass
 
-    try:
-        dl = trafilatura.fetch_url(url, no_ssl=True)
-        if dl:
+    if html:
+        result = (_extract_text_lxml(html) if _HAS_LXML else None) or _extract_text_bs4(html)
+        if result:
+            return result
+        try:
             ext = trafilatura.extract(
-                dl,
+                html,
                 include_comments=False,
                 include_tables=False,
                 no_fallback=False,
@@ -247,8 +265,8 @@ def fetch_article_text(url: str, timeout: int = FETCH_TIMEOUT) -> str | None:
             )
             if ext:
                 return ext
-    except Exception:
-        pass
+        except Exception:
+            pass
 
     return None
 
@@ -290,7 +308,7 @@ def resolve_short_urls_concurrently(urls: set, timeout: int = 4) -> dict:
         def _resolve(url):
             try:
                 r = session.head(url, allow_redirects=True, timeout=(2, timeout))
-                return url, r.url
+                return url, str(r.url)
             except Exception:
                 return url, url
         out = {}
@@ -305,11 +323,6 @@ def _signal_analysis():
         return
     os.makedirs("./clusters", exist_ok=True)
     open(SIGNAL_FILE, "w").close()
-
-
-def _chunked(lst, n):
-    for i in range(0, len(lst), n):
-        yield lst[i:i + n]
 
 
 class BlueskyHandler(FileSystemEventHandler):
@@ -332,9 +345,18 @@ class BlueskyHandler(FileSystemEventHandler):
             return
 
         print(f"\n[Watchdog] Ingesting: {filename}", flush=True)
+
+        try:
+            self._ingest(filepath, filename)
+        except Exception as exc:
+            import traceback
+            print(f"[Watchdog] UNHANDLED ERROR in {filename}: {exc}", flush=True)
+            traceback.print_exc()
+
+    def _ingest(self, filepath, filename):
         open_func = gzip.open if filepath.endswith(".gz") else open
 
-        short_urls_to_resolve: set[str] = set()
+        short_urls_to_resolve = set()
         try:
             with open_func(filepath, "rt", encoding="utf-8") as f:
                 for line in f:
@@ -343,9 +365,12 @@ class BlueskyHandler(FileSystemEventHandler):
                     try:
                         rec = json.loads(line)
                         for url in rec.get("urls", []):
-                            if _normalise_domain(url) in self.shorteners:
-                                short_urls_to_resolve.add(url)
-                    except json.JSONDecodeError:
+                            try:
+                                if _normalise_domain(url) in self.shorteners:
+                                    short_urls_to_resolve.add(url)
+                            except Exception:
+                                pass
+                    except Exception:
                         pass
         except Exception as e:
             print(f"[Watchdog] Error in pass 1: {e}", flush=True)
@@ -353,9 +378,9 @@ class BlueskyHandler(FileSystemEventHandler):
 
         resolved_map = resolve_short_urls_concurrently(short_urls_to_resolve)
 
-        seen:               set[str]  = set()
-        candidates:       list[dict]  = []
-        all_candidate_urls: list[str] = []
+        seen = set()
+        candidates = []
+        all_candidate_urls = []
 
         try:
             with open_func(filepath, "rt", encoding="utf-8") as f:
@@ -419,17 +444,21 @@ class BlueskyHandler(FileSystemEventHandler):
             database.mark_file_processed(filename)
             return
 
-        fetch_queue   = Queue(maxsize=FETCH_QUEUE_MAX)
-        embed_queue   = Queue(maxsize=EMBED_QUEUE_MAX)
-        fetcher_done  = threading.Event()
+        fetch_queue  = Queue()
+        embed_queue  = Queue(maxsize=EMBED_QUEUE_MAX)
+        fetcher_done = threading.Event()
+        batcher_done = threading.Event()
+
         failed_fetch  = [0]
         failed_embed  = [0]
         fetched_count = [0]
         embed_done    = [0]
-        total         = len(new_candidates)
-        t_start       = time.time()
-        milestones    = {total // 3, (2 * total) // 3, total}
-        logged        = set()
+        lock          = threading.Lock()
+
+        total      = len(new_candidates)
+        t_start    = time.time()
+        milestones = {total // 3, (2 * total) // 3, total}
+        logged     = set()
 
         def _fetch_and_clean(cand: dict):
             try:
@@ -445,90 +474,118 @@ class BlueskyHandler(FileSystemEventHandler):
             return cand
 
         def _fetcher_worker():
-            with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as pool:
-                futs = {pool.submit(_fetch_and_clean, c): c for c in new_candidates}
-                for fut in as_completed(futs):
-                    try:
-                        result = fut.result(timeout=FETCH_TIMEOUT + 3)
-                    except Exception:
-                        result = None
-                    if result:
-                        fetched_count[0] += 1
-                        fetch_queue.put(result)
-                    else:
-                        failed_fetch[0] += 1
+            try:
+                with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as pool:
+                    futs = {pool.submit(_fetch_and_clean, c): c for c in new_candidates}
+                    for fut in as_completed(futs):
+                        try:
+                            result = fut.result(timeout=FETCH_TIMEOUT + 3)
+                        except Exception:
+                            result = None
 
-                    done = fetched_count[0] + failed_fetch[0]
-                    milestone = min(milestones, key=lambda m: abs(m - done))
-                    if milestone not in logged and abs(milestone - done) <= max(1, total // 100):
-                        logged.add(milestone)
-                        elapsed = time.time() - t_start
-                        rate    = done / elapsed if elapsed > 0 else 0
-                        print(
-                            f"[Watchdog] {done}/{total} fetched "
-                            f"({fetched_count[0]} ok, {failed_fetch[0]} fail) "
-                            f"| {rate:.0f}/s | {embed_done[0]} embedded",
-                            flush=True,
-                        )
-            fetcher_done.set()
-            fetch_queue.put(None)
+                        with lock:
+                            if result:
+                                fetched_count[0] += 1
+                                fetch_queue.put(result)
+                            else:
+                                failed_fetch[0] += 1
+
+                            done      = fetched_count[0] + failed_fetch[0]
+                            milestone = min(milestones, key=lambda m: abs(m - done))
+                            if milestone not in logged and abs(milestone - done) <= max(1, total // 100):
+                                logged.add(milestone)
+                                elapsed = time.time() - t_start
+                                rate    = done / elapsed if elapsed > 0 else 0
+                                print(
+                                    f"[Watchdog] {done}/{total} fetched "
+                                    f"({fetched_count[0]} ok, {failed_fetch[0]} fail) "
+                                    f"| {rate:.0f}/s | {embed_done[0]} embedded",
+                                    flush=True,
+                                )
+            except Exception as exc:
+                import traceback
+                print(f"[Watchdog] _fetcher_worker crashed: {exc}", flush=True)
+                traceback.print_exc()
+            finally:
+                fetcher_done.set()
+                fetch_queue.put(None)
 
         def _batcher_worker():
             buffer = []
-            while True:
-                try:
-                    item = fetch_queue.get(timeout=5)
-                except Empty:
-                    if fetcher_done.is_set() and fetch_queue.empty():
-                        if buffer:
-                            embed_queue.put(buffer)
-                        embed_queue.put(None)
-                        return
-                    continue
-                if item is None:
-                    if buffer:
-                        embed_queue.put(buffer)
-                    embed_queue.put(None)
-                    return
-                buffer.append(item)
-                if len(buffer) >= EMBED_BATCH_SIZE:
-                    embed_queue.put(buffer)
-                    buffer = []
-
-        def _embed_worker():
-            with torch.inference_mode():
+            try:
                 while True:
                     try:
-                        batch = embed_queue.get(timeout=60)
+                        item = fetch_queue.get(timeout=1)
                     except Empty:
+                        if fetcher_done.is_set() and fetch_queue.empty():
+                            break
+                        continue
+
+                    if item is None:
                         break
-                    if batch is None:
-                        break
-                    try:
-                        texts   = [a["text"] for a in batch]
-                        emb_arr = np.asarray(
-                            self.embed_fn(self.model, texts), dtype=np.float32
-                        )
-                        for j, article in enumerate(batch):
-                            article["embedding"] = emb_arr[j]
-                        embed_done[0] += len(batch)
-                        database.batch_insert_articles([
-                            {
-                                "url":             a["url"],
-                                "domain":          a["domain"],
-                                "newsguard_score": a["score"],
-                                "text":            a["text"],
-                                "embedding":       a["embedding"],
-                                "did":             a.get("did", ""),
-                                "created_at":      a.get("created_at", ""),
-                                "likeCount":       a.get("likes",   0),
-                                "repostCount":     a.get("reposts", 0),
-                            }
-                            for a in batch
-                        ])
-                    except Exception as e:
-                        print(f"[Watchdog] Embed/insert batch failed: {e}", flush=True)
-                        failed_embed[0] += len(batch)
+
+                    buffer.append(item)
+                    if len(buffer) >= EMBED_BATCH_SIZE:
+                        embed_queue.put(buffer)
+                        buffer = []
+            except Exception as exc:
+                import traceback
+                print(f"[Watchdog] _batcher_worker crashed: {exc}", flush=True)
+                traceback.print_exc()
+            finally:
+                if buffer:
+                    embed_queue.put(buffer)
+                batcher_done.set()
+                embed_queue.put(None)
+
+        def _embed_worker():
+            try:
+                with torch.inference_mode():
+                    while True:
+                        try:
+                            batch = embed_queue.get(timeout=5)
+                        except Empty:
+                            if batcher_done.is_set() and embed_queue.empty():
+                                break
+                            continue
+
+                        if batch is None:
+                            break
+
+                        try:
+                            texts   = [a["text"] for a in batch]
+                            emb_arr = np.asarray(
+                                self.embed_fn(self.model, texts), dtype=np.float32
+                            )
+                            for j, article in enumerate(batch):
+                                article["embedding"] = emb_arr[j]
+
+                            database.batch_insert_articles([
+                                {
+                                    "url":             a["url"],
+                                    "domain":          a["domain"],
+                                    "newsguard_score": a["score"],
+                                    "text":            a["text"],
+                                    "embedding":       a["embedding"],
+                                    "did":             a.get("did", ""),
+                                    "created_at":      a.get("created_at", ""),
+                                    "likeCount":       a.get("likes",   0),
+                                    "repostCount":     a.get("reposts", 0),
+                                }
+                                for a in batch
+                            ])
+
+                            with lock:
+                                embed_done[0] += len(batch)
+
+                        except Exception as e:
+                            print(f"[Watchdog] Embed/insert batch failed: {e}", flush=True)
+                            with lock:
+                                failed_embed[0] += len(batch)
+            except Exception as exc:
+                import traceback
+                print(f"[Watchdog] _embed_worker crashed: {exc}", flush=True)
+                traceback.print_exc()
 
         print(
             f"[Watchdog] fetch({FETCH_WORKERS} threads, {FETCH_TIMEOUT}s timeout) → "

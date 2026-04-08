@@ -19,16 +19,13 @@ def _launch(script, log_path, old_log=None, cmd=None):
 
 
 def _wait_for_chroma(timeout=30):
-    urls = [
-        "http://localhost:8001/api/v2/heartbeat",
-    ]
+    url = "http://localhost:8001/api/v2/heartbeat"
     for _ in range(timeout):
-        for url in urls:
-            try:
-                urllib.request.urlopen(url, timeout=1)
-                return True
-            except Exception:
-                pass
+        try:
+            urllib.request.urlopen(url, timeout=1)
+            return True
+        except Exception:
+            pass
         time.sleep(1)
     return False
 
@@ -36,6 +33,11 @@ def _wait_for_chroma(timeout=30):
 def _chroma_cmd():
     chroma_bin = shutil.which("chroma") or os.path.join(os.path.dirname(sys.executable), "chroma")
     return [chroma_bin, "run", "--path", "./db/chroma_vector_db", "--port", "8001"]
+
+
+def _log_crash(name, proc):
+    code = proc.returncode
+    print(f"[Orchestrator] WARNING: {name} crashed! Exit code: {code}. Restarting...", flush=True)
 
 
 def main():
@@ -68,18 +70,23 @@ def main():
     try:
         while True:
             time.sleep(10)
+
             if chroma.poll() is not None:
-                print("[Orchestrator] WARNING: ChromaDB server crashed! Restarting...", flush=True)
+                _log_crash("ChromaDB server", chroma)
                 chroma, chroma_log = _launch(None, "chroma.log", chroma_log, cmd=_chroma_cmd())
                 if not _wait_for_chroma():
                     print("[Orchestrator] FATAL: ChromaDB server failed to recover.", flush=True)
                     sys.exit(1)
+                print("[Orchestrator] ChromaDB server recovered.", flush=True)
+
             if watchdog.poll() is not None:
-                print("[Orchestrator] WARNING: Watchdog Daemon crashed! Restarting...", flush=True)
+                _log_crash("Watchdog Daemon", watchdog)
                 watchdog, watchdog_log = _launch("watchdog_daemon.py", "watchdog.log", watchdog_log)
+
             if scheduler.poll() is not None:
-                print("[Orchestrator] WARNING: Periodic Analysis crashed! Restarting...", flush=True)
+                _log_crash("Periodic Analysis", scheduler)
                 scheduler, scheduler_log = _launch("periodic_analysis.py", "scheduler.log", scheduler_log)
+
     except KeyboardInterrupt:
         print("\n[Orchestrator] Shutting down all processes...", flush=True)
         watchdog.terminate()
