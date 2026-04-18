@@ -11,16 +11,20 @@ import aiohttp
 import requests
 import random
 import gc
-import signal
+import ssl
 from collections import defaultdict
 from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
 from contextlib import nullcontext
 from functools import lru_cache
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from watchdog.observers.polling import PollingObserver
 from watchdog.events import FileSystemEventHandler
 import numpy as np
 import database
+
+_SSL_CONTEXT = ssl.create_default_context()
+_SSL_CONTEXT.check_hostname = False
+_SSL_CONTEXT.verify_mode = ssl.CERT_NONE
 
 CPU_COUNT = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 1))
 _langdetect_lock = threading.Lock()
@@ -41,45 +45,52 @@ _RE_INVALID_XML = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1F\uD800-\uDFFF\uFFFE\uF
 HAS_GPU = torch.cuda.is_available()
 
 if HAS_GPU:
-    FETCH_WORKERS = 150
-    EMBED_BATCH_SIZE = 512
-    FETCH_TIMEOUT = 15
-    RESOLVE_WORKERS = 150
-    PIPELINE_CHUNK = 512
-    CONNECT_TIMEOUT = 5
-    MAX_RESPONSE_BYTES = 5_000_000
-    RESOLVE_CONCURRENCY = 150
-    DOMAIN_RATE_LIMIT = 0.5
-    QUEUE_MAXSIZE = 8
-    RESOLVE_POOL_WORKERS = min(CPU_COUNT, 4)
-    MGZIP_THREADS = min(CPU_COUNT, 8)
-    RESOLVE_BATCH_SIZE = 1000
-    EXTRACT_WORKERS = min(CPU_COUNT, 4)
+    FETCH_WORKERS        = 80
+    LIMIT_PER_HOST       = 10
+    FETCH_TIMEOUT        = 20
+    CONNECT_TIMEOUT      = 8
+    SOCK_READ_TIMEOUT    = 15 
+    DOMAIN_FAIL_THRESH   = 200
+    DOMAIN_RATE_LIMIT    = 0.1
+    RESOLVE_CONCURRENCY  = 150
+    RESOLVE_WORKERS      = 100
+    MAX_RESPONSE_BYTES   = 3_000_000
+    EMBED_BATCH_SIZE     = 512
+    PIPELINE_CHUNK       = 64
+    QUEUE_MAXSIZE        = 16
+    RESOLVE_POOL_WORKERS = min(CPU_COUNT, 8)
+    MGZIP_THREADS        = min(CPU_COUNT, 8)
+    RESOLVE_BATCH_SIZE   = 1000
+    EXTRACT_WORKERS      = 8
+    READ_CHUNK_SIZE      = 1024 * 1024
 else:
-    FETCH_WORKERS = 50
-    EMBED_BATCH_SIZE = 32
-    FETCH_TIMEOUT = 12
-    RESOLVE_WORKERS = 50
-    PIPELINE_CHUNK = 128
-    CONNECT_TIMEOUT = 4
-    MAX_RESPONSE_BYTES = 2_500_000
-    RESOLVE_CONCURRENCY = 50
-    DOMAIN_RATE_LIMIT = 0.2
-    QUEUE_MAXSIZE = 16
-    RESOLVE_POOL_WORKERS = 2
-    MGZIP_THREADS = 1
-    RESOLVE_BATCH_SIZE = 500
-    EXTRACT_WORKERS = 2
+    FETCH_WORKERS        = 50
+    LIMIT_PER_HOST       = 8
+    EMBED_BATCH_SIZE     = 32
+    FETCH_TIMEOUT        = 12
+    RESOLVE_WORKERS      = 100
+    PIPELINE_CHUNK       = 32
+    CONNECT_TIMEOUT      = 5
+    SOCK_READ_TIMEOUT    = 10
+    MAX_RESPONSE_BYTES   = 2_000_000
+    RESOLVE_CONCURRENCY  = 100
+    DOMAIN_RATE_LIMIT    = 0.05
+    QUEUE_MAXSIZE        = 8
+    DOMAIN_FAIL_THRESH   = 100
+    RESOLVE_POOL_WORKERS = 4
+    MGZIP_THREADS        = 2
+    RESOLVE_BATCH_SIZE   = 1000
+    EXTRACT_WORKERS      = 4
+    READ_CHUNK_SIZE      = 512 * 1024
 
 MAX_TEXT_CHARS = 3000
-PROGRESS_EVERY = 5
-DOMAIN_FAIL_THRESH = 10
-DNS_CACHE_TTL = 600
+PROGRESS_EVERY = 10
+DNS_CACHE_TTL = 1800
 SIGNAL_FILE = "./clusters/.analysis_needed"
 PASSAGE_WORD_LIMIT = 100
 ANALYSIS_SIGNAL_INTERVAL = 72
 
-_BSKY_LIKE_TYPE = "app.bsky.feed.like"
+_BSKY_LIKE_TYPE   = "app.bsky.feed.like"
 _BSKY_REPOST_TYPE = "app.bsky.feed.repost"
 
 _TRACKING_PARAMS = frozenset({
@@ -95,7 +106,7 @@ _TRACKING_PARAMS = frozenset({
 try:
     import resource
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    target = min(hard, 65536)
+    target = min(hard, 131072)
     if soft < target:
         try:
             resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
@@ -108,12 +119,14 @@ except ImportError:
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    print("[Watchdog] Using uvloop for faster async", flush=True)
 except ImportError:
     pass
 
 try:
     import orjson as _json_lib
     def _json_loads(b): return _json_lib.loads(b)
+    print("[Watchdog] Using orjson for faster JSON parsing", flush=True)
 except ImportError:
     try:
         import ujson as _json_lib
@@ -137,50 +150,97 @@ except ImportError:
 
 try:
     from readability import Document
-    from bs4 import BeautifulSoup
+    from bs4 import BeautifulSoup, SoupStrainer
     _HAS_READABILITY = True
+    _BODY_STRAINER = SoupStrainer(['p', 'article', 'div', 'section', 'main'])
 except ImportError:
     _HAS_READABILITY = False
+    _BODY_STRAINER = None
 
 try:
     import trafilatura as _trafilatura
+    from trafilatura.settings import use_config
+    _TRAF_CONFIG = use_config()
+    _TRAF_CONFIG.set("DEFAULT", "EXTRACTION_TIMEOUT", "5")
     _HAS_TRAFILATURA = True
 except ImportError:
     _HAS_TRAFILATURA = False
+    _TRAF_CONFIG = None
 
 if not _HAS_READABILITY and not _HAS_TRAFILATURA:
     print("[Watchdog] FATAL: neither readability-lxml nor trafilatura available.", flush=True)
     sys.exit(1)
 
+try:
+    import aiodns
+    _HAS_AIODNS = True
+except ImportError:
+    _HAS_AIODNS = False
+
 _embedding_module = None
 _http_session = None
 _http_session_lock = threading.Lock()
 _DEVICE = None
-_extract_pool = None
-_extract_pool_lock = threading.Lock()
 
 _domain_fail_counts: dict[str, int] = defaultdict(int)
 _domain_fail_lock = threading.Lock()
 _domain_blacklist: set[str] = set()
-_domain_locks: dict[str, asyncio.Lock] = {}
-_domain_last_hit: dict[str, float] = {}
 
 _files_processed_since_analysis = 0
 _files_processed_lock = threading.Lock()
 
+_EXTRACT_POOL: ThreadPoolExecutor | None = None
+_EXTRACT_POOL_LOCK = threading.Lock()
+
 _WHALES = frozenset(["reuters.com", "bloomberg.com", "nytimes.com", "wsj.com", "ft.com"])
 
 _HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate, br",
+    "DNT": "1",
     "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1"
+    "Upgrade-Insecure-Requests": "1",
 }
 
+_dns_cache: dict[str, tuple[str, float]] = {}
+_dns_cache_lock = threading.Lock()
 
-@lru_cache(maxsize=1 << 18)
+_MULTI_SPACE    = re.compile(r'\s+')
+_URL_RE         = re.compile(r'https?://\S+', re.IGNORECASE)
+_WWW_RE         = re.compile(r"^www\.")
+_HTML_TAG_RE    = re.compile(r'<[^>]+>')
+
+_error_counts: dict[str, int] = defaultdict(int)
+_error_lock = threading.Lock()
+
+
+def _log_error_type(error_type: str):
+    with _error_lock:
+        _error_counts[error_type] += 1
+
+
+def _print_error_summary():
+    with _error_lock:
+        if _error_counts:
+            print(f"[Watchdog] Error summary: {dict(_error_counts)}", flush=True)
+            _error_counts.clear()
+
+
+def _get_extract_pool() -> ThreadPoolExecutor:
+    global _EXTRACT_POOL
+    if _EXTRACT_POOL is None:
+        with _EXTRACT_POOL_LOCK:
+            if _EXTRACT_POOL is None:
+                _EXTRACT_POOL = ThreadPoolExecutor(
+                    max_workers=EXTRACT_WORKERS,
+                    thread_name_prefix="extractor",
+                )
+    return _EXTRACT_POOL
+
+
+@lru_cache(maxsize=1 << 20)
 def normalise_url(url: str) -> str:
     if not url:
         return url
@@ -188,27 +248,23 @@ def normalise_url(url: str) -> str:
         parsed = urlparse(url)
         if parsed.query:
             params = parse_qs(parsed.query, keep_blank_values=False)
-            filtered = {
-                k: v for k, v in params.items()
-                if k.lower() not in _TRACKING_PARAMS
-            }
+            filtered = {k: v for k, v in params.items() if k.lower() not in _TRACKING_PARAMS}
             new_query = urlencode(filtered, doseq=True) if filtered else ''
         else:
             new_query = ''
-        normalized = urlunparse((
+        return urlunparse((
             parsed.scheme,
             parsed.netloc.lower(),
             parsed.path.rstrip('/') if parsed.path != '/' else '/',
             parsed.params,
             new_query,
-            ''
+            '',
         ))
-        return normalized
     except Exception:
         return url
 
 
-@lru_cache(maxsize=1 << 17)
+@lru_cache(maxsize=1 << 18)
 def _normalise_domain(raw: str) -> str:
     raw = raw.strip().lower()
     if raw.startswith("http"):
@@ -216,12 +272,33 @@ def _normalise_domain(raw: str) -> str:
             raw = urlparse(raw).netloc
         except Exception:
             return ""
-    return re.sub(r"^www\.", "", raw).rstrip("/")
+    return _WWW_RE.sub("", raw).rstrip("/")
 
 
-@lru_cache(maxsize=1 << 17)
+@lru_cache(maxsize=1 << 18)
 def _parent_domain(domain: str) -> str:
-    return ".".join(domain.split(".")[-2:]) if domain.count(".") >= 2 else domain
+    parts = domain.split(".")
+    return ".".join(parts[-2:]) if len(parts) >= 2 else domain
+
+
+@lru_cache(maxsize=1 << 16)
+def _extract_domain_from_url(url: str) -> str:
+    try:
+        if url.startswith("http://"):
+            start = 7
+        elif url.startswith("https://"):
+            start = 8
+        else:
+            return ""
+        end = url.find("/", start)
+        if end == -1:
+            end = len(url)
+        domain = url[start:end].lower()
+        if domain.startswith("www."):
+            domain = domain[4:]
+        return domain
+    except Exception:
+        return ""
 
 
 def _fmt_eta(seconds: float) -> str:
@@ -234,19 +311,14 @@ def _fmt_eta(seconds: float) -> str:
     return f"{seconds:.0f}s"
 
 
-_SENT_SPLIT = re.compile(r'(?<=[.!?])\s+(?=[A-Z])')
-_MULTI_SPACE = re.compile(r'\s+')
-_URL_RE = re.compile(r'https?://\S+', re.IGNORECASE)
-
-
 class ProgressTracker:
-    STATUS_FILE = "./logs/progress_status.json"
+    __slots__ = ('filename', 'total', 't_start', '_lock', '_counters', '_stop', '_thread')
 
     def __init__(self, filename: str, total: int):
-        self.filename = filename
-        self.total = total
-        self.t_start = time.time()
-        self._lock = threading.Lock()
+        self.filename  = filename
+        self.total     = total
+        self.t_start   = time.time()
+        self._lock     = threading.Lock()
         self._counters = dict(
             lines_read=0, candidates=0, existing=0, new=0,
             fetched=0, fetch_fail=0, embedded=0, embed_fail=0,
@@ -255,7 +327,7 @@ class ProgressTracker:
             pending_resolve=0, resolved=0, resolve_batches_sent=0,
             interactions_recorded=0,
         )
-        self._stop = threading.Event()
+        self._stop   = threading.Event()
         self._thread = threading.Thread(target=self._reporter, daemon=True)
         self._thread.start()
 
@@ -267,6 +339,11 @@ class ProgressTracker:
     def inc(self, key: str, n: int = 1):
         with self._lock:
             self._counters[key] = self._counters.get(key, 0) + n
+
+    def inc_multi(self, **kwargs):
+        with self._lock:
+            for k, v in kwargs.items():
+                self._counters[k] = self._counters.get(k, 0) + v
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -282,16 +359,15 @@ class ProgressTracker:
             self._write_status()
 
     def _write_status(self):
-        snap = self.snapshot()
+        snap    = self.snapshot()
         elapsed = time.time() - self.t_start
-        phase = snap["phase"]
+        phase   = snap["phase"]
 
         if phase == "scan+resolve":
-            pending = snap.get("pending_resolve", 0)
+            pending  = snap.get("pending_resolve", 0)
             resolved = snap.get("resolved", 0)
-            batches = snap.get("resolve_batches_sent", 0)
+            batches  = snap.get("resolve_batches_sent", 0)
             resolve_rate = resolved / elapsed if elapsed > 0 else 0
-
             print(
                 f"[Watchdog] [{phase:14s}] "
                 f"read={snap['lines_read']:,} cands={snap['candidates']:,} | "
@@ -299,14 +375,13 @@ class ProgressTracker:
                 flush=True,
             )
         else:
-            new = snap["new"]
-            fetched = snap["fetched"]
-            fail = snap["fetch_fail"]
+            new         = snap["new"]
+            fetched     = snap["fetched"]
+            fail        = snap["fetch_fail"]
             quality_rej = snap.get("quality_rejected", 0)
-            done = fetched + fail + quality_rej
-            rate = done / elapsed if elapsed > 0 else 0
-            eta = _fmt_eta((new - done) / rate if rate > 0 and new > done else 0)
-
+            done        = fetched + fail + quality_rej
+            rate        = done / elapsed if elapsed > 0 else 0
+            eta         = _fmt_eta((new - done) / rate if rate > 0 and new > done else 0)
             print(
                 f"[Watchdog] [{phase:14s}] "
                 f"read={snap['lines_read']:,} cands={snap['candidates']:,} "
@@ -327,7 +402,7 @@ def _get_device():
 def _make_session() -> requests.Session:
     adapter = requests.adapters.HTTPAdapter(
         pool_connections=FETCH_WORKERS,
-        pool_maxsize=FETCH_WORKERS,
+        pool_maxsize=FETCH_WORKERS * 2,
         max_retries=0,
     )
     s = requests.Session()
@@ -346,53 +421,23 @@ def _get_session() -> requests.Session:
     return _http_session
 
 
-def segment_into_passages(text: str, word_limit: int = PASSAGE_WORD_LIMIT) -> list:
-    if not text:
-        return []
-
-    paragraphs = re.split(r'\n\t+', text)
-    passages = []
-
-    for para in paragraphs:
-        para = para.strip()
-        if not para:
-            continue
-
-        words = para.split()
-        if len(words) <= word_limit:
-            if para:
-                passages.append(para)
-        else:
-            for i in range(0, len(words), word_limit):
-                chunk_words = words[i:i + word_limit]
-                if chunk_words:
-                    passages.append(" ".join(chunk_words))
-
-    return passages if passages else [text[:500]]
-
-
 def clean_article_text(text: str, min_len: int = 150) -> str | None:
     if not text:
         return None
-
     text = text[:MAX_TEXT_CHARS * 3]
     text = _URL_RE.sub(" ", text)
-    text = re.sub(r'<[^>]+>', ' ', text)
+    text = _HTML_TAG_RE.sub(' ', text)
 
     if _HAS_LANGDETECT:
         try:
             with _langdetect_lock:
-                if detect(text[:500]) != "en":
+                if detect(text[:300]) != "en":
                     return None
         except Exception:
             return None
 
     text = _MULTI_SPACE.sub(" ", text).strip()
-
-    if len(text) < min_len:
-        return None
-
-    return text
+    return text if len(text) >= min_len else None
 
 
 def _extract_with_readability(html: str) -> str | None:
@@ -400,8 +445,8 @@ def _extract_with_readability(html: str) -> str | None:
         return None
     try:
         scrubbed_html = _RE_INVALID_XML.sub("", html)
-        doc = Document(scrubbed_html)
-        soup = BeautifulSoup(doc.summary(), "lxml")
+        doc  = Document(scrubbed_html)
+        soup = BeautifulSoup(doc.summary(), "lxml", parse_only=_BODY_STRAINER)
         text = soup.get_text(separator=" ", strip=True)
         return text if len(text) >= 150 else None
     except Exception:
@@ -413,8 +458,12 @@ def _extract_with_trafilatura(html: str) -> str | None:
         return None
     try:
         result = _trafilatura.extract(
-            html, include_comments=False, include_tables=False,
-            no_fallback=False, favor_precision=True,
+            html,
+            include_comments=False,
+            include_tables=False,
+            no_fallback=True,
+            favor_precision=False,
+            config=_TRAF_CONFIG,
         )
         return result if result and len(result) >= 150 else None
     except Exception:
@@ -422,15 +471,15 @@ def _extract_with_trafilatura(html: str) -> str | None:
 
 
 def _extract_and_clean(html: str) -> str | None:
-    text = _extract_with_trafilatura(html)
-
-    if not text:
-        text = _extract_with_readability(html)
-
-    if not text:
+    try:
+        text = _extract_with_trafilatura(html)
+        if not text:
+            text = _extract_with_readability(html)
+        if not text:
+            return None
+        return clean_article_text(text)
+    except Exception:
         return None
-
-    return clean_article_text(text)
 
 
 def _is_domain_blacklisted(domain: str) -> bool:
@@ -446,96 +495,118 @@ def _record_domain_fail(domain: str):
 
 
 def _reset_domain_state():
-    global _domain_locks, _domain_last_hit
     with _domain_fail_lock:
         _domain_fail_counts.clear()
         _domain_blacklist.clear()
-    _domain_locks = {}
-    _domain_last_hit = {}
 
 
 async def _check_connectivity() -> bool:
-    test_urls = ["https://www.reuters.com", "https://www.bbc.com"]
-    to = aiohttp.ClientTimeout(total=10, connect=CONNECT_TIMEOUT)
+    test_urls = ["https://httpbin.org/get", "https://example.com", "https://www.google.com"]
+    to = aiohttp.ClientTimeout(total=10, connect=5)
     try:
-        async with aiohttp.ClientSession(headers=_HEADERS) as session:
+        conn = aiohttp.TCPConnector(ssl=_SSL_CONTEXT)
+        async with aiohttp.ClientSession(headers=_HEADERS, connector=conn) as session:
             for url in test_urls:
                 try:
-                    async with session.head(url, timeout=to, ssl=False) as r:
-                        if r.status < 500:
+                    async with session.get(url, timeout=to) as r:
+                        if r.status == 200:
+                            print(f"[Watchdog] Connectivity confirmed via {url}", flush=True)
                             return True
-                except Exception:
+                except Exception as e:
+                    print(f"[Watchdog] Connectivity test failed for {url}: {type(e).__name__}", flush=True)
                     continue
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[Watchdog] Connectivity check error: {e}", flush=True)
     return False
-
-
-async def _polite_delay(domain: str):
-    if domain not in _domain_locks:
-        _domain_locks[domain] = asyncio.Lock()
-    async with _domain_locks[domain]:
-        now = asyncio.get_event_loop().time()
-        last_hit = _domain_last_hit.get(domain, 0)
-        gap = now - last_hit
-        if gap < DOMAIN_RATE_LIMIT:
-            await asyncio.sleep(DOMAIN_RATE_LIMIT - gap)
-        _domain_last_hit[domain] = asyncio.get_event_loop().time()
-
-
-_extraction_lock = threading.Lock()
 
 
 async def _async_fetch_one(
     session: aiohttp.ClientSession,
     cand: dict,
     timeout: aiohttp.ClientTimeout,
+    extract_pool: ThreadPoolExecutor,
+    sem: asyncio.Semaphore,
 ) -> dict | str | None:
-    url = cand["url"]
+    url    = cand["url"]
     domain = cand["domain"]
 
     if any(whale in domain for whale in _WHALES):
         return "WHALE_SKIP"
 
     if _is_domain_blacklisted(domain):
+        return "BLACKLISTED"
+
+    async with sem:
+        try:
+            async with session.get(
+                url,
+                timeout=timeout,
+                allow_redirects=True,
+                max_redirects=5,      
+            ) as r:
+                if r.status >= 400:
+                    _log_error_type(f"http_{r.status}")
+                    if r.status in (403, 404, 410, 451):
+                        return None
+                    _record_domain_fail(domain)
+                    return None
+
+                ct = r.headers.get("Content-Type", "")
+                if ct and not any(t in ct for t in ("text/html", "text/plain", "application/xhtml")):
+                    _log_error_type("bad_content_type")
+                    return None
+
+                cl = r.headers.get("Content-Length")
+                if cl and int(cl) > MAX_RESPONSE_BYTES:
+                    _log_error_type("too_large")
+                    return None
+
+                content = await r.content.read(MAX_RESPONSE_BYTES)
+
+        except asyncio.TimeoutError:
+            _log_error_type("timeout")
+            _record_domain_fail(domain)
+            return None
+        except aiohttp.TooManyRedirects:
+            _log_error_type("too_many_redirects")
+            return None
+        except aiohttp.ClientSSLError:
+            _log_error_type("ssl_error")
+            return None
+        except aiohttp.ClientConnectorError:
+            _log_error_type("connector_error")
+            _record_domain_fail(domain)
+            return None
+        except aiohttp.ServerDisconnectedError:
+            _log_error_type("server_disconnected")
+            return None
+        except Exception as e:
+            _log_error_type(f"other_{type(e).__name__}")
+            _record_domain_fail(domain)
+            return None
+
+    if not content:
+        _log_error_type("empty_response")
         return None
 
-    await _polite_delay(domain)
-
-    try:
-        async with session.get(url, timeout=timeout, allow_redirects=True, ssl=False) as r:
-            if r.status >= 400:
-                _record_domain_fail(domain)
-                return None
-            cl = r.headers.get("Content-Length")
-            if cl and int(cl) > MAX_RESPONSE_BYTES:
-                return None
-            content = await r.content.read(MAX_RESPONSE_BYTES)
-    except asyncio.TimeoutError:
-        _record_domain_fail(domain)
-        return None
-    except Exception:
-        _record_domain_fail(domain)
-        return None
-
-    html = content.decode("utf-8", errors="replace")
+    html = content.decode("utf-8", errors="ignore")
     del content
 
+    if len(html) < 500:
+        _log_error_type("html_too_short")
+        return "QUALITY_REJECT"
+
     loop = asyncio.get_event_loop()
-
-    def _safe_extract():
-        with _extraction_lock:
-            return _extract_and_clean(html)
-
     try:
-        clean = await loop.run_in_executor(None, _safe_extract)
+        clean = await loop.run_in_executor(extract_pool, _extract_and_clean, html)
     except Exception:
+        _log_error_type("extract_error")
         return "QUALITY_REJECT"
 
     if not clean:
         return "QUALITY_REJECT"
 
-    cand = dict(cand)
+    cand        = dict(cand)
     cand["text"] = clean
     return cand
 
@@ -555,13 +626,23 @@ async def _async_fetch_all_pipelined(
     model,
     timeout: int = FETCH_TIMEOUT,
 ):
-    to = aiohttp.ClientTimeout(total=timeout, connect=CONNECT_TIMEOUT)
+    extract_pool = _get_extract_pool()
+
+    to = aiohttp.ClientTimeout(
+        total=timeout,
+        connect=CONNECT_TIMEOUT,
+        sock_read=SOCK_READ_TIMEOUT,
+    )
+
+    resolver = aiohttp.AsyncResolver() if _HAS_AIODNS else aiohttp.DefaultResolver()
     conn = aiohttp.TCPConnector(
-        limit=FETCH_WORKERS,
+        limit=FETCH_WORKERS * 2,
+        limit_per_host=LIMIT_PER_HOST,
         ttl_dns_cache=DNS_CACHE_TTL,
         enable_cleanup_closed=True,
         force_close=False,
-        ssl=False,
+        ssl=_SSL_CONTEXT,
+        resolver=resolver,
     )
 
     import queue as _queue
@@ -570,10 +651,7 @@ async def _async_fetch_all_pipelined(
     embed_thread_done = threading.Event()
 
     def embed_db_worker():
-        if HAS_GPU:
-            stream = torch.cuda.Stream()
-        else:
-            stream = None
+        stream = torch.cuda.Stream() if HAS_GPU else None
 
         while True:
             chunk = chunk_ready.get()
@@ -586,46 +664,40 @@ async def _async_fetch_all_pipelined(
             texts = [a["text"] for a in chunk]
 
             try:
-                if HAS_GPU and stream is not None:
-                    ctx = torch.cuda.stream(stream)
-                else:
-                    ctx = nullcontext()
-
+                ctx = torch.cuda.stream(stream) if (HAS_GPU and stream) else nullcontext()
                 with torch.inference_mode(), ctx:
                     emb_arr = _embed_batch(embed_fn, model, texts)
-
-                if HAS_GPU and stream is not None:
+                if HAS_GPU and stream:
                     stream.synchronize()
-
                 for j, article in enumerate(chunk):
                     article["embedding"] = emb_arr[j]
                 prog.inc("embedded", len(chunk))
-
             except Exception as e:
                 print(f"[Watchdog] Embed batch failed: {e}", flush=True)
                 prog.inc("embed_fail", len(chunk))
                 continue
 
+            to_insert = [a for a in chunk if "embedding" in a]
             try:
                 database.batch_insert_articles([
                     {
-                        "url": a["url"],
-                        "domain": a["domain"],
-                        "newsguard_score": a["score"],
-                        "text": a["text"],
-                        "embedding": a["embedding"],
-                        "original_did": a.get("original_did", ""),
-                        "new_did": a.get("new_did", ""),
-                        "created_at": a.get("created_at", ""),
-                        "like_count": a.get("likes", 0),
-                        "repost_count": a.get("reposts", 0),
+                        "url":              a["url"],
+                        "domain":           a["domain"],
+                        "newsguard_score":  a["score"],
+                        "text":             a["text"],
+                        "embedding":        a["embedding"],
+                        "original_did":     a.get("original_did", ""),
+                        "new_did":          a.get("new_did", ""),
+                        "created_at":       a.get("created_at", ""),
+                        "like_count":       a.get("likes", 0),
+                        "repost_count":     a.get("reposts", 0),
                     }
-                    for a in chunk if "embedding" in a
+                    for a in to_insert
                 ])
-                prog.inc("inserted", len([a for a in chunk if "embedding" in a]))
+                prog.inc("inserted", len(to_insert))
             except Exception as e:
                 print(f"[Watchdog] DB insert failed: {e}", flush=True)
-                prog.inc("db_fail", len(chunk))
+                prog.inc("db_fail", len(to_insert))
 
         embed_thread_done.set()
 
@@ -634,100 +706,122 @@ async def _async_fetch_all_pipelined(
 
     try:
         async with aiohttp.ClientSession(connector=conn, headers=_HEADERS) as session:
-            sem = asyncio.Semaphore(FETCH_WORKERS)
+            sem    = asyncio.Semaphore(FETCH_WORKERS)
             buffer = []
-            buf_lock = asyncio.Lock()
+
+            def _flush_buffer():
+                nonlocal buffer
+                while len(buffer) >= PIPELINE_CHUNK:
+                    chunk  = buffer[:PIPELINE_CHUNK]
+                    buffer = buffer[PIPELINE_CHUNK:]
+                    try:
+                        chunk_ready.put_nowait(chunk)
+                    except _queue.Full:
+                        chunk_ready.put(chunk)
 
             async def _guarded(cand):
-                async with sem:
-                    result = await _async_fetch_one(session, cand, to)
+                result = await _async_fetch_one(session, cand, to, extract_pool, sem)
                 if result == "WHALE_SKIP":
                     prog.inc("skipped_whales")
+                    return None
+                elif result == "BLACKLISTED":
+                    prog.inc("fetch_fail")
                     return None
                 elif result == "QUALITY_REJECT":
                     prog.inc("quality_rejected")
                     return None
                 elif result:
                     prog.inc("fetched")
+                    return result
                 else:
                     prog.inc("fetch_fail")
-                return result
-
-            async def _flush_if_ready():
-                nonlocal buffer
-                async with buf_lock:
-                    if len(buffer) >= PIPELINE_CHUNK:
-                        chunk = buffer[:PIPELINE_CHUNK]
-                        buffer = buffer[PIPELINE_CHUNK:]
-                        try:
-                            chunk_ready.put_nowait(chunk)
-                        except _queue.Full:
-                            loop = asyncio.get_event_loop()
-                            await loop.run_in_executor(None, chunk_ready.put, chunk)
-
+                    return None
             tasks = [asyncio.create_task(_guarded(c)) for c in candidates]
-            for coro in asyncio.as_completed(tasks):
+
+            for fut in asyncio.as_completed(tasks):
                 try:
-                    r = await coro
-                    if r and isinstance(r, dict):
-                        async with buf_lock:
-                            buffer.append(r)
-                        await _flush_if_ready()
+                    r = await fut
+                    if r is not None:
+                        buffer.append(r)
+                        _flush_buffer()
                 except Exception:
                     prog.inc("fetch_fail")
 
-            async with buf_lock:
-                if buffer:
-                    try:
-                        chunk_ready.put_nowait(buffer)
-                    except _queue.Full:
-                        loop = asyncio.get_event_loop()
-                        await loop.run_in_executor(None, chunk_ready.put, buffer)
+            if buffer:
+                try:
+                    chunk_ready.put_nowait(buffer)
+                except _queue.Full:
+                    chunk_ready.put(buffer)
+
     finally:
         chunk_ready.put(SENTINEL)
-        embed_thread_done.wait(timeout=60)
+        embed_thread_done.wait(timeout=120)
+        _print_error_summary()
 
 
-async def _async_resolve_one(
+async def _async_resolve_batch(
     session: aiohttp.ClientSession,
-    url: str,
+    urls: list[str],
     timeout: aiohttp.ClientTimeout,
     sem: asyncio.Semaphore,
-) -> tuple[str, str]:
-    async with sem:
+) -> dict[str, str]:
+    results = {}
+
+    async def resolve_one(url: str) -> tuple[str, str]:
+        async with sem:
+            try:
+                async with session.head(url, allow_redirects=True, timeout=timeout) as r:
+                    return url, str(r.url)
+            except Exception:
+                try:
+                    async with session.get(url, allow_redirects=True, timeout=timeout) as r:
+                        return url, str(r.url)
+                except Exception:
+                    return url, url
+
+    tasks = [resolve_one(u) for u in urls]
+    for coro in asyncio.as_completed(tasks):
         try:
-            async with session.head(url, allow_redirects=True, timeout=timeout, ssl=False) as r:
-                if r.status == 405:
-                    async with session.get(url, allow_redirects=True, timeout=timeout, ssl=False) as r2:
-                        return url, str(r2.url)
-                return url, str(r.url)
+            orig, resolved = await coro
+            results[orig] = resolved
         except Exception:
-            return url, url
+            pass
+
+    return results
 
 
-async def _resolve_batch_async(urls: list[str], timeout: int = 10) -> dict[str, str]:
+async def _resolve_all_urls(urls: list[str], prog: ProgressTracker) -> dict[str, str]:
     if not urls:
         return {}
-    to = aiohttp.ClientTimeout(total=timeout, connect=CONNECT_TIMEOUT)
-    conn = aiohttp.TCPConnector(limit=RESOLVE_CONCURRENCY, ttl_dns_cache=DNS_CACHE_TTL, ssl=False)
-    sem = asyncio.Semaphore(RESOLVE_CONCURRENCY)
-    try:
-        async with aiohttp.ClientSession(connector=conn, headers=_HEADERS) as session:
-            results = await asyncio.gather(
-                *[_async_resolve_one(session, u, to, sem) for u in urls],
-                return_exceptions=True,
-            )
-        return {r[0]: r[1] for r in results if isinstance(r, tuple)}
-    finally:
-        await conn.close()
+
+    to       = aiohttp.ClientTimeout(total=10, connect=5)
+    resolver = aiohttp.AsyncResolver() if _HAS_AIODNS else aiohttp.DefaultResolver()
+    conn     = aiohttp.TCPConnector(
+        limit=RESOLVE_CONCURRENCY,
+        ttl_dns_cache=DNS_CACHE_TTL,
+        ssl=_SSL_CONTEXT,
+        resolver=resolver,
+    )
+
+    results = {}
+    sem     = asyncio.Semaphore(RESOLVE_CONCURRENCY)
+
+    async with aiohttp.ClientSession(connector=conn, headers=_HEADERS) as session:
+        for i in range(0, len(urls), RESOLVE_BATCH_SIZE):
+            batch        = urls[i:i + RESOLVE_BATCH_SIZE]
+            prog.inc("resolve_batches_sent")
+            batch_results = await _async_resolve_batch(session, batch, to, sem)
+            results.update(batch_results)
+            prog.inc("resolved", len(batch_results))
+
+    return results
 
 
 def _run_async(coro):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        result = loop.run_until_complete(coro)
-        return result
+        return loop.run_until_complete(coro)
     finally:
         try:
             pending = asyncio.all_tasks(loop)
@@ -750,18 +844,18 @@ def _normalise_domain_plain(raw: str) -> str:
     return re.sub(r"^www\.", "", raw).rstrip("/")
 
 
-def load_shortener_domains(csv_path: str) -> set:
+def load_shortener_domains(csv_path: str) -> frozenset:
     import pandas as pd
     shorteners: set[str] = set()
     if not os.path.exists(csv_path):
-        return shorteners
+        return frozenset(shorteners)
     try:
         df = pd.read_csv(csv_path, header=None)
         for val in df[0].dropna():
             shorteners.add(_normalise_domain_plain(str(val)))
     except Exception:
         pass
-    return shorteners
+    return frozenset(shorteners)
 
 
 def load_newsguard(newsguard_dir: str) -> dict:
@@ -792,7 +886,7 @@ def _signal_analysis_if_needed():
             print(
                 f"[Watchdog] Files until next analysis: "
                 f"{ANALYSIS_SIGNAL_INTERVAL - _files_processed_since_analysis}",
-                flush=True
+                flush=True,
             )
 
 
@@ -801,7 +895,6 @@ def _do_signal_analysis():
     if os.path.exists(running_file):
         print("[Watchdog] Analysis already running, skipping signal", flush=True)
         return
-
     os.makedirs("./clusters", exist_ok=True)
     open(SIGNAL_FILE, "w").close()
     print("[Watchdog] Signaled analysis needed", flush=True)
@@ -809,7 +902,7 @@ def _do_signal_analysis():
 
 def load_embedding_model(embed_dir: str, weights_path: str):
     global _embedding_module
-    device = _get_device()
+    device    = _get_device()
     embed_dir = os.path.abspath(embed_dir)
     if embed_dir not in sys.path:
         sys.path.insert(0, embed_dir)
@@ -821,14 +914,14 @@ def load_embedding_model(embed_dir: str, weights_path: str):
         f"torch.load('{weights_path}', map_location=device, weights_only=False)",
         source,
     )
-    mod = types.ModuleType("embeddings")
+    mod          = types.ModuleType("embeddings")
     mod.__file__ = src_path
     mod.__dict__["device"] = device
     sys.modules["embeddings"] = mod
     exec(compile(source, src_path, "exec"), mod.__dict__)
     _embedding_module = mod
     embed_fn = mod.get_sentence_embeddings
-    model = mod.model
+    model    = mod.model
     if hasattr(model, "to"):
         model.to(device)
     if hasattr(model, "eval"):
@@ -838,31 +931,25 @@ def load_embedding_model(embed_dir: str, weights_path: str):
 
 def _open_file(filepath: str):
     if not filepath.endswith(".gz"):
-        return open(filepath, "rt", encoding="utf-8", errors="replace")
+        return open(filepath, "rt", encoding="utf-8", errors="replace", buffering=READ_CHUNK_SIZE)
     if _HAS_MGZIP:
-        return _mgzip.open(filepath, "rt", encoding="utf-8", errors="replace",
-                          thread=MGZIP_THREADS)
+        return _mgzip.open(filepath, "rt", encoding="utf-8", errors="replace", thread=MGZIP_THREADS)
     return gzip.open(filepath, "rt", encoding="utf-8", errors="replace")
 
 
 def _engagement_from_record(rec: dict) -> tuple:
-    new_type = rec.get("newType", "")
-    explicit_likes = int(rec.get("likeCount", 0) or 0)
+    new_type         = rec.get("newType", "")
+    explicit_likes   = int(rec.get("likeCount", 0) or 0)
     explicit_reposts = int(rec.get("repostCount", 0) or 0)
-    event_likes = 1 if new_type == _BSKY_LIKE_TYPE else 0
-    event_reposts = 1 if new_type == _BSKY_REPOST_TYPE else 0
-
-    original_did = rec.get("originalDid", "")
-    new_did = rec.get("newDid", "")
-    created_at = rec.get("newCreatedAt", "")
-
+    event_likes      = 1 if new_type == _BSKY_LIKE_TYPE else 0
+    event_reposts    = 1 if new_type == _BSKY_REPOST_TYPE else 0
     return (
-        explicit_likes + event_likes,
+        explicit_likes   + event_likes,
         explicit_reposts + event_reposts,
-        original_did,
-        new_did,
+        rec.get("originalDid", ""),
+        rec.get("newDid", ""),
         new_type,
-        created_at,
+        rec.get("newCreatedAt", ""),
     )
 
 
@@ -870,78 +957,93 @@ def _ingest_single_pass(
     filepath: str,
     filename: str,
     ng_map: dict,
-    shorteners: set,
+    shorteners: frozenset,
     embed_fn,
     model,
     prog: ProgressTracker,
 ):
     url_to_candidate: dict[str, dict] = {}
-    interactions_buffer: list[dict] = []
-    pending_short: list[str] = []
-    resolved_map: dict[str, str] = {}
-    resolve_futures: list = []
+    interactions_buffer: list[dict]   = []
+    short_urls_to_resolve: set[str]   = set()
+    lines_since_flush = 0
 
-    from concurrent.futures import ThreadPoolExecutor
-    _resolve_pool = ThreadPoolExecutor(max_workers=RESOLVE_POOL_WORKERS, thread_name_prefix="resolver")
+    prog.set_phase("scan")
 
-    def _flush_resolve_batch(urls: list[str]):
-        prog.inc("resolve_batches_sent")
-        return _resolve_pool.submit(_run_async, _resolve_batch_async(list(urls)))
+    try:
+        with _open_file(filepath) as f:
+            for raw_line in f:
+                if not raw_line or raw_line == "\n":
+                    continue
+                lines_since_flush += 1
 
-    def _collect_resolved():
-        still_running = []
-        for fut, orig_urls in resolve_futures:
-            if fut.done():
+                if lines_since_flush >= 100_000:
+                    prog.inc("lines_read", lines_since_flush)
+                    lines_since_flush = 0
+
                 try:
-                    result = fut.result()
-                    resolved_map.update(result)
-                    prog.inc("resolved", len(result))
+                    rec  = _json_loads(raw_line)
+                    urls = rec.get("urls")
+                    if not urls:
+                        continue
                 except Exception:
-                    pass
-            else:
-                still_running.append((fut, orig_urls))
-        resolve_futures.clear()
-        resolve_futures.extend(still_running)
+                    continue
 
-    def _wait_all_resolved(timeout=60):
-        print(f"[Watchdog] Waiting for {len(resolve_futures)} resolve futures...", flush=True)
-        for i, (fut, _) in enumerate(resolve_futures):
-            try:
-                result = fut.result(timeout=timeout)
-                resolved_map.update(result)
-                prog.inc("resolved", len(result))
-            except Exception as e:
-                print(f"[Watchdog] Resolve future {i} failed: {e}", flush=True)
-        resolve_futures.clear()
-        print(f"[Watchdog] All resolve futures complete", flush=True)
+                for raw_url in urls:
+                    if not raw_url:
+                        continue
+                    domain = _extract_domain_from_url(raw_url)
+                    if domain in shorteners:
+                        short_urls_to_resolve.add(raw_url)
+
+    except Exception as e:
+        print(f"[Watchdog] Error in scan pass: {e}", flush=True)
+        return None, None
+    finally:
+        if lines_since_flush:
+            prog.inc("lines_read", lines_since_flush)
+
+    prog.set_phase("resolve")
+    prog.inc("pending_resolve", len(short_urls_to_resolve))
+
+    if short_urls_to_resolve:
+        print(f"[Watchdog] Resolving {len(short_urls_to_resolve):,} shortened URLs...", flush=True)
+        resolved_map = _run_async(_resolve_all_urls(list(short_urls_to_resolve), prog))
+    else:
+        resolved_map = {}
+
+    del short_urls_to_resolve
+    gc.collect()
+
+    prog.set_phase("process")
+    lines_since_flush = 0
 
     def _add_or_accumulate(final_url, final_domain, score, likes, reposts, original_did, new_did, interaction_type, created_at):
         normalized_url = normalise_url(final_url)
-
         if normalized_url in url_to_candidate:
-            url_to_candidate[normalized_url]["likes"] += likes
-            url_to_candidate[normalized_url]["reposts"] += reposts
-            if created_at and (not url_to_candidate[normalized_url]["created_at"] or created_at < url_to_candidate[normalized_url]["created_at"]):
-                url_to_candidate[normalized_url]["created_at"] = created_at
+            c = url_to_candidate[normalized_url]
+            c["likes"]   += likes
+            c["reposts"] += reposts
+            if created_at and (not c["created_at"] or created_at < c["created_at"]):
+                c["created_at"] = created_at
         else:
             url_to_candidate[normalized_url] = {
-                "url": normalized_url,
-                "domain": final_domain,
-                "score": score,
-                "likes": likes,
-                "reposts": reposts,
+                "url":          normalized_url,
+                "domain":       final_domain,
+                "score":        score,
+                "likes":        likes,
+                "reposts":      reposts,
                 "original_did": original_did,
-                "new_did": new_did,
-                "created_at": created_at,
+                "new_did":      new_did,
+                "created_at":   created_at,
             }
             prog.inc("candidates")
 
         if new_did and interaction_type:
             interactions_buffer.append({
-                "url": normalized_url,
-                "actor_did": new_did,
+                "url":              normalized_url,
+                "actor_did":        new_did,
                 "interaction_type": interaction_type,
-                "created_at": created_at,
+                "created_at":       created_at,
             })
 
     try:
@@ -949,15 +1051,14 @@ def _ingest_single_pass(
             for raw_line in f:
                 if not raw_line or raw_line == "\n":
                     continue
-                prog.inc("lines_read")
-                n = prog.snapshot()["lines_read"]
-                if n % 500_000 == 0:
-                    _collect_resolved()
-                    if n % 2_000_000 == 0:
-                        gc.collect()
+                lines_since_flush += 1
+
+                if lines_since_flush >= 100_000:
+                    prog.inc("lines_read", lines_since_flush)
+                    lines_since_flush = 0
 
                 try:
-                    rec = _json_loads(raw_line)
+                    rec  = _json_loads(raw_line)
                     likes, reposts, original_did, new_did, interaction_type, created_at = _engagement_from_record(rec)
                     urls = rec.get("urls")
                     if not urls:
@@ -969,73 +1070,30 @@ def _ingest_single_pass(
                     if not raw_url:
                         continue
 
-                    domain = _normalise_domain(raw_url)
+                    domain = _extract_domain_from_url(raw_url)
 
                     if domain in shorteners:
-                        if raw_url not in resolved_map and raw_url not in pending_short:
-                            pending_short.append(raw_url)
-                            prog.inc("pending_resolve")
-                            if len(pending_short) >= RESOLVE_BATCH_SIZE:
-                                batch = pending_short[:]
-                                pending_short.clear()
-                                resolve_futures.append(
-                                    (_flush_resolve_batch(batch), batch)
-                                )
-                        final_url = resolved_map.get(raw_url)
-                        if final_url is None:
-                            continue
+                        final_url    = resolved_map.get(raw_url, raw_url)
+                        final_domain = _extract_domain_from_url(final_url)
                     else:
-                        final_url = raw_url
+                        final_url    = raw_url
+                        final_domain = domain
 
-                    final_domain = _normalise_domain(final_url)
                     parent = _parent_domain(final_domain)
-                    score = ng_map.get(final_domain) or ng_map.get(parent)
+                    score  = ng_map.get(final_domain) or ng_map.get(parent)
                     if score is None or score < 0:
                         continue
 
                     _add_or_accumulate(final_url, final_domain, score, likes, reposts, original_did, new_did, interaction_type, created_at)
 
     except Exception as e:
-        print(f"[Watchdog] Error reading file: {e}", flush=True)
-        _resolve_pool.shutdown(wait=False)
+        print(f"[Watchdog] Error in process pass: {e}", flush=True)
         return None, None
+    finally:
+        if lines_since_flush:
+            prog.inc("lines_read", lines_since_flush)
 
-    if pending_short:
-        resolve_futures.append((_flush_resolve_batch(pending_short), pending_short))
-
-    _wait_all_resolved()
-    _resolve_pool.shutdown(wait=True)
-
-    if resolved_map:
-        try:
-            with _open_file(filepath) as f:
-                for raw_line in f:
-                    if not raw_line or raw_line == "\n":
-                        continue
-                    try:
-                        rec = _json_loads(raw_line)
-                        urls = rec.get("urls")
-                        if not urls:
-                            continue
-                        likes, reposts, original_did, new_did, interaction_type, created_at = _engagement_from_record(rec)
-                    except Exception:
-                        continue
-
-                    for raw_url in urls:
-                        if not raw_url:
-                            continue
-                        if _normalise_domain(raw_url) not in shorteners:
-                            continue
-                        final_url = resolved_map.get(raw_url, raw_url)
-                        final_domain = _normalise_domain(final_url)
-                        parent = _parent_domain(final_domain)
-                        score = ng_map.get(final_domain) or ng_map.get(parent)
-                        if score is None or score < 0:
-                            continue
-                        _add_or_accumulate(final_url, final_domain, score, likes, reposts, original_did, new_did, interaction_type, created_at)
-        except Exception as e:
-            print(f"[Watchdog] Error in second pass: {e}", flush=True)
-
+    del resolved_map
     gc.collect()
 
     candidates = list(url_to_candidate.values())
@@ -1051,10 +1109,10 @@ def _ingest_single_pass(
 
 class BlueskyHandler(FileSystemEventHandler):
     def __init__(self, ng_map, shorteners, embed_fn, model):
-        self.ng_map = ng_map
-        self.shorteners = shorteners
-        self.embed_fn = embed_fn
-        self.model = model
+        self.ng_map      = ng_map
+        self.shorteners  = shorteners
+        self.embed_fn    = embed_fn
+        self.model       = model
         self._processing_lock = threading.Lock()
 
     def on_created(self, event):
@@ -1067,7 +1125,6 @@ class BlueskyHandler(FileSystemEventHandler):
         if not self._processing_lock.acquire(blocking=False):
             print(f"[Watchdog] Already processing a file, skipping {filepath}", flush=True)
             return
-
         try:
             filename = os.path.basename(filepath)
             if database.is_file_processed(filename):
@@ -1088,9 +1145,7 @@ class BlueskyHandler(FileSystemEventHandler):
     def _ingest(self, filepath, filename):
         _reset_domain_state()
 
-        prog = ProgressTracker(filename, total=0)
-        prog.set_phase("scan+resolve")
-
+        prog   = ProgressTracker(filename, total=0)
         result = _ingest_single_pass(
             filepath, filename,
             self.ng_map, self.shorteners,
@@ -1104,19 +1159,13 @@ class BlueskyHandler(FileSystemEventHandler):
             return
 
         candidates, interactions_buffer = result
-
         all_urls = [c["url"] for c in candidates]
 
         prog.set_phase("db_dedup")
-        existing = database.get_existing_urls(all_urls)
+        existing       = database.get_existing_urls(all_urls)
         new_candidates = [c for c in candidates if c["url"] not in existing]
-        stat_updates = [
-            (c["url"], c["likes"], c["reposts"])
-            for c in candidates if c["url"] in existing
-        ]
-        prog.inc("existing", len(existing))
-        prog.inc("new", len(new_candidates))
-
+        stat_updates   = [(c["url"], c["likes"], c["reposts"]) for c in candidates if c["url"] in existing]
+        prog.inc_multi(existing=len(existing), new=len(new_candidates))
         database.batch_update_stats(stat_updates)
 
         if interactions_buffer:
@@ -1125,9 +1174,7 @@ class BlueskyHandler(FileSystemEventHandler):
             prog.inc("interactions_recorded", inserted_interactions)
             print(f"[Watchdog] Recorded {inserted_interactions:,} interactions", flush=True)
 
-        del candidates
-        del all_urls
-        del interactions_buffer
+        del candidates, all_urls, interactions_buffer
         gc.collect()
 
         if not new_candidates:
@@ -1168,26 +1215,18 @@ class BlueskyHandler(FileSystemEventHandler):
             loop.close()
 
         snap = prog.snapshot()
-        inserted = snap["inserted"]
-        fetched = snap["fetched"]
-        fetch_fail = snap["fetch_fail"]
-        quality_rej = snap["quality_rejected"]
-        skipped = snap["skipped_whales"]
-        interactions_rec = snap["interactions_recorded"]
-
         prog.stop()
 
-        if inserted > 0 or len(new_candidates) == 0:
+        if snap["inserted"] > 0 or len(new_candidates) == 0:
             database.mark_file_processed(filename)
 
         print(
             f"[Watchdog] Finished {filename}: "
-            f"{inserted} inserted, {fetched} fetched, "
-            f"{fetch_fail} failed, {quality_rej} quality_rejected, {skipped} skipped, "
-            f"{interactions_rec} interactions",
-            flush=True
+            f"{snap['inserted']} inserted, {snap['fetched']} fetched, "
+            f"{snap['fetch_fail']} failed, {snap['quality_rejected']} quality_rejected, "
+            f"{snap['skipped_whales']} skipped, {snap['interactions_recorded']} interactions",
+            flush=True,
         )
-
         _signal_analysis_if_needed()
 
 
@@ -1202,7 +1241,7 @@ if __name__ == "__main__":
     database.init_db()
     _get_session()
 
-    ng_map = load_newsguard("./NewsGuard")
+    ng_map     = load_newsguard("./NewsGuard")
     shorteners = load_shortener_domains("./NewsGuard/shorturl-services-list.csv")
     embed_fn, model = load_embedding_model(
         "./embedding_model",
