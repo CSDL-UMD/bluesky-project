@@ -1,183 +1,383 @@
-import sqlite3
 import os
+import gc
+import sqlite3
 import threading
-import chromadb
+import numpy as np
+import h5py
 
-DB_DIR     = "./db"
-DB_PATH    = os.path.join(DB_DIR, "bluesky_file_ledger.db")
-CHROMA_HOST = "localhost"
-CHROMA_PORT = 8001
+DB_DIR = "./db"
+SQLITE_PATH = os.path.join(DB_DIR, "ledger.db")
+HDF5_PATH = os.path.join(DB_DIR, "embeddings.h5")
+EMBED_DIM = 768
 
-_chroma_client     = None
-_chroma_collection = None
-_chroma_lock       = threading.Lock()
-_CHROMA_MAX_BATCH  = None
-
-
-def _get_max_batch():
-    global _CHROMA_MAX_BATCH
-    if _CHROMA_MAX_BATCH is None:
-        try:
-            _CHROMA_MAX_BATCH = get_chroma_collection()._client.get_max_batch_size()
-        except Exception:
-            _CHROMA_MAX_BATCH = 5000
-    return _CHROMA_MAX_BATCH
+_lock = threading.Lock()
+_local = threading.local()
 
 
-def _chunked(lst, n):
-    for i in range(0, len(lst), n):
-        yield lst[i:i + n]
+def _conn():
+    if not hasattr(_local, "conn") or _local.conn is None:
+        os.makedirs(DB_DIR, exist_ok=True)
+        con = sqlite3.connect(SQLITE_PATH, check_same_thread=False)
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA synchronous=NORMAL")
+        con.execute("PRAGMA cache_size=-65536")
+        con.execute("PRAGMA temp_store=MEMORY")
+        con.execute("PRAGMA mmap_size=536870912")
+        _local.conn = con
+    return _local.conn
+
+
+def _hdf5(mode="r"):
+    os.makedirs(DB_DIR, exist_ok=True)
+    return h5py.File(HDF5_PATH, mode)
 
 
 def init_db():
-    print("[Database] Initializing SQLite ledger...", flush=True)
     os.makedirs(DB_DIR, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('''
+    conn = _conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS articles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT UNIQUE NOT NULL,
+            domain TEXT NOT NULL,
+            newsguard_score REAL,
+            text TEXT,
+            original_did TEXT DEFAULT '',
+            new_did TEXT DEFAULT '',
+            created_at TEXT DEFAULT '',
+            like_count INTEGER DEFAULT 0,
+            repost_count INTEGER DEFAULT 0,
+            cluster_id INTEGER DEFAULT -1
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS interactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT NOT NULL,
+            actor_did TEXT NOT NULL,
+            interaction_type TEXT NOT NULL,
+            created_at TEXT DEFAULT '',
+            UNIQUE(url, actor_did, interaction_type, created_at)
+        )
+    """)
+
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS processed_files (
-            filename     TEXT PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filename TEXT UNIQUE NOT NULL,
             processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-    ''')
+    """)
+
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_articles_url ON articles(url)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_articles_domain ON articles(domain)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_articles_cluster ON articles(cluster_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_articles_created ON articles(created_at)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_interactions_url ON interactions(url)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_interactions_actor ON interactions(actor_did)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_interactions_created ON interactions(created_at)")
+
+    existing_cols = {row[1] for row in cur.execute("PRAGMA table_info(articles)").fetchall()}
+    if "new_did" not in existing_cols:
+        cur.execute("ALTER TABLE articles ADD COLUMN new_did TEXT DEFAULT ''")
+
     conn.commit()
-    conn.close()
-    print("[Database] SQLite ledger ready.", flush=True)
 
+    if not os.path.exists(HDF5_PATH):
+        with h5py.File(HDF5_PATH, "w") as f:
+            f.create_dataset("urls", shape=(0,), maxshape=(None,), dtype=h5py.special_dtype(vlen=str))
+            f.create_dataset("embeddings", shape=(0, EMBED_DIM), maxshape=(None, EMBED_DIM), dtype=np.float32)
 
-def get_chroma_collection():
-    global _chroma_client, _chroma_collection
-    with _chroma_lock:
-        if _chroma_collection is None:
-            _chroma_client = chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
-            _chroma_collection = _chroma_client.get_or_create_collection(
-                name="bluesky_articles",
-                metadata={"hnsw:space": "cosine"},
-            )
-    return _chroma_collection
+    print(f"[Database] Initialized at {SQLITE_PATH}", flush=True)
 
 
 def is_file_processed(filename):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT 1 FROM processed_files WHERE filename = ?", (filename,))
-    exists = cursor.fetchone() is not None
-    conn.close()
-    return exists
+    conn = _conn()
+    row = conn.execute(
+        "SELECT 1 FROM processed_files WHERE filename=?", (filename,)
+    ).fetchone()
+    return row is not None
 
 
 def mark_file_processed(filename):
-    print(f"[Database] Marking file as processed: {filename}", flush=True)
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("INSERT OR IGNORE INTO processed_files (filename) VALUES (?)", (filename,))
+    conn = _conn()
+    conn.execute(
+        "INSERT OR IGNORE INTO processed_files (filename) VALUES (?)", (filename,)
+    )
     conn.commit()
-    conn.close()
 
 
-def get_article_metadata(url):
-    res = get_chroma_collection().get(ids=[url], include=["metadatas"])
-    if res and res.get("ids"):
-        return res["metadatas"][0]
-    return None
+def url_exists(url):
+    conn = _conn()
+    row = conn.execute("SELECT 1 FROM articles WHERE url=?", (url,)).fetchone()
+    return row is not None
 
 
 def get_existing_urls(urls):
     if not urls:
-        return {}
-    chunk_size = _get_max_batch()
-    found = {}
-    col = get_chroma_collection()
-    for chunk in _chunked(urls, chunk_size):
-        res = col.get(ids=chunk, include=["metadatas"])
-        if res and res.get("ids"):
-            for uid, meta in zip(res["ids"], res["metadatas"]):
-                found[uid] = meta or {}
-    return found
+        return set()
+    conn = _conn()
+    placeholders = ",".join("?" * len(urls))
+    rows = conn.execute(
+        f"SELECT url FROM articles WHERE url IN ({placeholders})", urls
+    ).fetchall()
+    return {r[0] for r in rows}
+
+
+def batch_check_urls(urls):
+    return get_existing_urls(urls)
 
 
 def batch_update_stats(updates):
     if not updates:
         return
-    chunk_size = _get_max_batch()
-    col = get_chroma_collection()
-    for chunk in _chunked(updates, chunk_size):
-        urls = [u for u, _, _ in chunk]
-        res = col.get(ids=urls, include=["metadatas"])
-        if not res or not res.get("ids"):
-            continue
-        delta = {u: (l, r) for u, l, r in chunk}
-        new_metas = []
-        for uid, meta in zip(res["ids"], res["metadatas"]):
-            meta = meta or {}
-            dl, dr = delta.get(uid, (0, 0))
-            meta["likeCount"]   = meta.get("likeCount",   0) + dl
-            meta["repostCount"] = meta.get("repostCount", 0) + dr
-            new_metas.append(meta)
-        col.update(ids=res["ids"], metadatas=new_metas)
+    with _lock:
+        conn = _conn()
+        cur = conn.cursor()
+        for url, likes, reposts in updates:
+            cur.execute(
+                """UPDATE articles 
+                   SET like_count = like_count + ?, repost_count = repost_count + ?
+                   WHERE url = ?""",
+                (likes, reposts, url)
+            )
+        conn.commit()
 
 
-def batch_insert_articles(articles):
-    if not articles:
-        return
-    chunk_size = _get_max_batch()
-    col = get_chroma_collection()
-    for chunk in _chunked(articles, chunk_size):
-        ids        = [a["url"]               for a in chunk]
-        embeddings = [a["embedding"].tolist() for a in chunk]
-        documents  = [a["text"]              for a in chunk]
-        metadatas  = [
-            {
-                "domain":          str(a["domain"]),
-                "newsguard_score": float(a["newsguard_score"]),
-                "originalDid":     str(a.get("did", ""))        or "",
-                "createdAt":       str(a.get("created_at", "")) or "",
-                "likeCount":       int(a.get("likeCount",   0)),
-                "repostCount":     int(a.get("repostCount", 0)),
-            }
-            for a in chunk
-        ]
-        col.upsert(
-            ids        = ids,
-            embeddings = embeddings,
-            documents  = documents,
-            metadatas  = metadatas,
-        )
+def batch_insert_interactions(interactions):
+    if not interactions:
+        return 0
+    with _lock:
+        conn = _conn()
+        inserted = 0
+        for inter in interactions:
+            try:
+                conn.execute(
+                    """INSERT OR IGNORE INTO interactions 
+                       (url, actor_did, interaction_type, created_at)
+                       VALUES (?, ?, ?, ?)""",
+                    (inter["url"], inter["actor_did"], inter["interaction_type"], inter.get("created_at", "")),
+                )
+                inserted += 1
+            except sqlite3.IntegrityError:
+                continue
+        conn.commit()
+        return inserted
+
+
+def insert_article(url, domain, newsguard_score, text, embedding, original_did="", new_did="", created_at="", like_count=0, repost_count=0):
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute(
+                """INSERT OR IGNORE INTO articles 
+                   (url, domain, newsguard_score, text, original_did, new_did, created_at, like_count, repost_count)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (url, domain, newsguard_score, text, original_did, new_did, created_at, like_count, repost_count),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            return False
+
+        with _hdf5("a") as f:
+            urls_ds = f["urls"]
+            emb_ds = f["embeddings"]
+            n = urls_ds.shape[0]
+            urls_ds.resize((n + 1,))
+            emb_ds.resize((n + 1, EMBED_DIM))
+            urls_ds[n] = url
+            emb_ds[n] = embedding.astype(np.float32)
+
+        return True
+
+
+def batch_insert_articles(articles_data):
+    if not articles_data:
+        return 0
+
+    articles_data = sorted(articles_data, key=lambda x: x["url"])
+
+    with _lock:
+        conn = _conn()
+        inserted = 0
+        new_urls = []
+        new_embeddings = []
+
+        for a in articles_data:
+            url = a["url"]
+            domain = a["domain"]
+            newsguard_score = a["newsguard_score"]
+            text = a["text"]
+            embedding = a["embedding"]
+            original_did = a.get("original_did", "")
+            new_did = a.get("new_did", "")
+            created_at = a.get("created_at", "")
+            like_count = a.get("like_count", 0)
+            repost_count = a.get("repost_count", 0)
+
+            try:
+                conn.execute(
+                    """INSERT OR IGNORE INTO articles 
+                       (url, domain, newsguard_score, text, original_did, new_did, created_at, like_count, repost_count)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (url, domain, newsguard_score, text, original_did, new_did, created_at, like_count, repost_count),
+                )
+                if conn.total_changes > inserted:
+                    new_urls.append(url)
+                    new_embeddings.append(embedding.astype(np.float32))
+                    inserted += 1
+            except sqlite3.IntegrityError:
+                continue
+
+        conn.commit()
+
+        if new_urls:
+            sorted_pairs = sorted(zip(new_urls, new_embeddings), key=lambda x: x[0])
+            new_urls = [p[0] for p in sorted_pairs]
+            new_embeddings = [p[1] for p in sorted_pairs]
+
+            with _hdf5("a") as f:
+                urls_ds = f["urls"]
+                emb_ds = f["embeddings"]
+                n = urls_ds.shape[0]
+                urls_ds.resize((n + len(new_urls),))
+                emb_ds.resize((n + len(new_urls), EMBED_DIM))
+                for i, (u, e) in enumerate(zip(new_urls, new_embeddings)):
+                    urls_ds[n + i] = u
+                    emb_ds[n + i] = e
+
+        return inserted
 
 
 def get_all_articles():
-    print("[Database] Fetching all embedded articles from ChromaDB...", flush=True)
-    PAGE_SIZE = 1000
-    articles  = []
-    offset    = 0
-    col = get_chroma_collection()
-    while True:
-        res = col.get(
-            include=["embeddings", "metadatas", "documents"],
-            limit=PAGE_SIZE,
-            offset=offset,
-        )
-        if not res or not res.get("ids"):
-            break
-        for i in range(len(res["ids"])):
-            meta = res["metadatas"][i] or {}
+    conn = _conn()
+    rows = conn.execute(
+        """SELECT url, domain, newsguard_score, text, original_did, new_did, created_at, like_count, repost_count 
+           FROM articles"""
+    ).fetchall()
+
+    url_to_row = {r[0]: r for r in rows}
+
+    with _hdf5("r") as f:
+        urls = f["urls"][:]
+        embeddings = f["embeddings"][:]
+
+    articles = []
+    for i, url in enumerate(urls):
+        if isinstance(url, bytes):
+            url = url.decode("utf-8")
+        if url in url_to_row:
+            r = url_to_row[url]
             articles.append({
-                "url":             res["ids"][i],
-                "text":            res["documents"][i],
-                "embedding":       res["embeddings"][i],
-                "domain":          meta.get("domain", ""),
-                "newsguard_score": meta.get("newsguard_score"),
-                "originalDid":     meta.get("originalDid", ""),
-                "createdAt":       meta.get("createdAt", ""),
-                "likeCount":       meta.get("likeCount",  0),
-                "repostCount":     meta.get("repostCount", 0),
+                "url": url,
+                "domain": r[1],
+                "newsguard_score": r[2],
+                "text": r[3],
+                "original_did": r[4],
+                "new_did": r[5],
+                "created_at": r[6],
+                "like_count": r[7],
+                "repost_count": r[8],
+                "embedding": embeddings[i],
             })
-        fetched = len(res["ids"])
-        offset += fetched
-        if fetched < PAGE_SIZE:
-            break
-    if not articles:
-        print("[Database] ChromaDB is currently empty.", flush=True)
-    else:
-        print(f"[Database] Successfully retrieved {len(articles)} articles.", flush=True)
+
+    articles.sort(key=lambda x: x["url"])
     return articles
+
+
+def get_articles_by_date_range(start_date, end_date):
+    conn = _conn()
+    rows = conn.execute(
+        """SELECT url, domain, newsguard_score, text, original_did, new_did, created_at, like_count, repost_count 
+           FROM articles
+           WHERE created_at >= ? AND created_at <= ?
+           ORDER BY created_at""",
+        (start_date, end_date)
+    ).fetchall()
+
+    url_to_row = {r[0]: r for r in rows}
+
+    if not url_to_row:
+        return []
+
+    with _hdf5("r") as f:
+        urls = f["urls"][:]
+        embeddings = f["embeddings"][:]
+
+    articles = []
+    for i, url in enumerate(urls):
+        if isinstance(url, bytes):
+            url = url.decode("utf-8")
+        if url in url_to_row:
+            r = url_to_row[url]
+            articles.append({
+                "url": url,
+                "domain": r[1],
+                "newsguard_score": r[2],
+                "text": r[3],
+                "original_did": r[4],
+                "new_did": r[5],
+                "created_at": r[6],
+                "like_count": r[7],
+                "repost_count": r[8],
+                "embedding": embeddings[i],
+            })
+
+    articles.sort(key=lambda x: x["created_at"])
+    return articles
+
+
+def get_article_count():
+    conn = _conn()
+    row = conn.execute("SELECT COUNT(*) FROM articles").fetchone()
+    return row[0] if row else 0
+
+
+def get_domain_stats():
+    conn = _conn()
+    rows = conn.execute(
+        """SELECT domain, COUNT(*) as cnt, AVG(newsguard_score) as avg_score
+           FROM articles GROUP BY domain ORDER BY cnt DESC"""
+    ).fetchall()
+    return [{"domain": r[0], "count": r[1], "avg_score": r[2]} for r in rows]
+
+
+def get_temporal_stats():
+    conn = _conn()
+    rows = conn.execute(
+        """SELECT DATE(created_at) as date, COUNT(*) as cnt
+           FROM articles 
+           WHERE created_at != ''
+           GROUP BY DATE(created_at) 
+           ORDER BY date"""
+    ).fetchall()
+    return [{"date": r[0], "count": r[1]} for r in rows]
+
+
+def get_interactions_for_url(url):
+    conn = _conn()
+    rows = conn.execute(
+        """SELECT actor_did, interaction_type, created_at FROM interactions WHERE url=?""",
+        (url,)
+    ).fetchall()
+    return [{"actor_did": r[0], "interaction_type": r[1], "created_at": r[2]} for r in rows]
+
+
+def clear_all():
+    with _lock:
+        conn = _conn()
+        conn.execute("DELETE FROM articles")
+        conn.execute("DELETE FROM interactions")
+        conn.execute("DELETE FROM processed_files")
+        conn.commit()
+
+        if os.path.exists(HDF5_PATH):
+            os.remove(HDF5_PATH)
+            with h5py.File(HDF5_PATH, "w") as f:
+                f.create_dataset("urls", shape=(0,), maxshape=(None,), dtype=h5py.special_dtype(vlen=str))
+                f.create_dataset("embeddings", shape=(0, EMBED_DIM), maxshape=(None, EMBED_DIM), dtype=np.float32)
+
+    print("[Database] Cleared all data", flush=True)

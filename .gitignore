@@ -2,6 +2,9 @@ Payload
 NewsGuard
 Messages
 analysis
+data
+logs
+test_data
 # Preprint Results
 Gephi_Like
 Gephi_Repost
@@ -31,3 +34,7 @@ narratives/db
 narratives/chroma.log
 narratives/scheduler.log
 narratives/watchdog.log
+
+#slurm
+narratives/narrative.slurm
+narratives/narrative_cpu.slurm
